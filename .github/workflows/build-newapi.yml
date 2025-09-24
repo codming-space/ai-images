@@ -1,0 +1,105 @@
+name: Build Custom New API Docker Image
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The tag version you want to build from upstream"
+        required: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/newapi
+
+jobs:
+  build-and-push-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Set up environment
+        run: |
+          echo "Building custom New API with tag: ${{ github.event.inputs.tag }}"
+
+      - name: Checkout upstream New API repository
+        uses: actions/checkout@v4
+        with:
+          repository: 'QuantumNous/new-api'
+          ref: ${{ github.event.inputs.tag }}
+          path: 'upstream'
+
+      - name: Checkout override dockerfile
+        uses: actions/checkout@v4
+        with:
+          path: 'overrides'
+
+      - name: Apply overrides
+        run: |
+          echo "Applying override files for version ${{ github.event.inputs.tag }}"
+          if [ -d "overrides/new-api/${{ github.event.inputs.tag }}" ]; then
+            echo "Found override directory for ${{ github.event.inputs.tag }}"
+
+            echo "Files in override directory:"
+            find overrides/new-api/${{ github.event.inputs.tag }} -type f
+
+            echo "Applying override files..."
+            cp -r overrides/new-api/${{ github.event.inputs.tag }}/* upstream/
+            echo "Override files copied successfully"
+          else
+            echo "No override directory found for ${{ github.event.inputs.tag }}, proceeding with original upstream code"
+          fi
+
+          mkdir -p frontend
+          cp -r upstream/web/* frontend/
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Build frontend with Bun
+        run: |
+          cd frontend
+          ls -al
+          bun install
+          DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=${{ github.event.inputs.tag }} bun run build
+          cd ..
+          mv frontend/dist upstream/web
+          cd upstream
+          git describe --tags > VERSION
+          cat VERSION
+          git status
+          git diff
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./upstream
+          file: ./upstream/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.event.inputs.tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64,linux/arm64,linux/s390x
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

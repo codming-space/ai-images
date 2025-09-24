@@ -1,1 +1,1 @@
-# ai-images
+# AI Images
