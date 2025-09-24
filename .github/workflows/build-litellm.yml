@@ -1,0 +1,119 @@
+name: Build Custom LiteLLM Docker Image
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The tag version you want to build from upstream"
+        required: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/litellm
+
+jobs:
+  build-and-push-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Set up environment
+        run: |
+          echo "Building custom LiteLLM with tag: ${{ github.event.inputs.tag }}"
+
+      - name: Checkout upstream LiteLLM repository
+        uses: actions/checkout@v4
+        with:
+          repository: 'BerriAI/litellm'
+          ref: ${{ github.event.inputs.tag }}
+          path: 'upstream'
+
+      - name: Checkout override files repository
+        uses: actions/checkout@v4
+        with:
+          path: 'overrides'
+
+      - name: Apply override files
+        run: |
+          echo "Applying override files for version ${{ github.event.inputs.tag }}"
+          if [ -d "overrides/litellm/${{ github.event.inputs.tag }}" ]; then
+            echo "Found override directory for ${{ github.event.inputs.tag }}"
+
+            echo "Files in override directory:"
+            find overrides/litellm/${{ github.event.inputs.tag }} -type f
+
+            echo ""
+            echo "=========================================="
+            echo "Showing diff for each override file:"
+            echo "=========================================="
+
+            find overrides/litellm/${{ github.event.inputs.tag }} -type f | while read override_file; do
+              relative_path="${override_file#overrides/litellm/${{ github.event.inputs.tag }}/}"
+              upstream_file="upstream/${relative_path}"
+
+              echo ""
+              echo "📄 Diff for: ${relative_path}"
+              echo "----------------------------------------"
+
+              if [ -f "$upstream_file" ]; then
+                echo "Showing changes (- original, + override):"
+                diff -u "$upstream_file" "$override_file" || true
+              else
+                echo "🆕 New file being added:"
+                echo "Content:"
+                cat "$override_file"
+              fi
+              echo "----------------------------------------"
+            done
+
+            echo ""
+            echo "=========================================="
+            echo "Applying override files..."
+            echo "=========================================="
+
+            cp -r overrides/litellm/${{ github.event.inputs.tag }}/* upstream/
+            echo "Override files copied successfully"
+
+          else
+            echo "No override directory found for ${{ github.event.inputs.tag }}, proceeding with original upstream code"
+          fi
+
+      - name: Set working directory
+        run: |
+          cd upstream
+          echo "Current directory: $(pwd)"
+          echo "Files in upstream directory:"
+          ls -la
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./upstream
+          file: ./upstream/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.event.inputs.tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
