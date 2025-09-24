@@ -3,8 +3,7 @@ FROM golang:alpine AS go-builder
 
 ENV GO111MODULE=on \
     CGO_ENABLED=0 \
-    GOOS=linux \
-    GOARCH=s390x
+    GOOS=linux
 
 WORKDIR /build
 

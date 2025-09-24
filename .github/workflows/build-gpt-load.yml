@@ -49,12 +49,28 @@ jobs:
             echo "No override directory found for ${{ github.event.inputs.tag }}, proceeding with original upstream code"
           fi
 
-      - name: Set working directory
+          # Prepare frontend build directory
+          mkdir -p frontend
+          cp -r upstream/web/* frontend/
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build frontend with npm
         run: |
+          cd frontend
+          ls -al
+          npm install
+          VITE_VERSION=${{ github.event.inputs.tag }} npm run build
+          cd ..
+          mv frontend/dist upstream/web/
           cd upstream
           echo "Current directory: $(pwd)"
           echo "Files in upstream directory:"
           ls -la
+          git status
           git diff
 
       - name: Log in to GitHub Container Registry
@@ -86,7 +102,7 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.event.inputs.tag }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           labels: ${{ steps.meta.outputs.labels }}
-          platforms: linux/amd64,linux/arm64, linux/s390x
+          platforms: linux/amd64,linux/arm64,linux/s390x
           build-args: |
             VERSION=${{ github.event.inputs.tag }}
           cache-from: type=gha
