@@ -1,0 +1,93 @@
+name: Build Custom GPT-Load Docker Image
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The tag version you want to build from upstream"
+        required: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/gpt-load
+
+jobs:
+  build-and-push-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Set up environment
+        run: |
+          echo "Building custom GPT-Load with tag: ${{ github.event.inputs.tag }}"
+
+      - name: Checkout upstream GPT-Load repository
+        uses: actions/checkout@v4
+        with:
+          repository: 'tbphp/gpt-load'
+          ref: ${{ github.event.inputs.tag }}
+          path: 'upstream'
+
+      - name: Checkout override files repository
+        uses: actions/checkout@v4
+        with:
+          path: 'overrides'
+
+      - name: Apply override files
+        run: |
+          echo "Applying override files for version ${{ github.event.inputs.tag }}"
+          if [ -d "overrides/gpt-load/${{ github.event.inputs.tag }}" ]; then
+            echo "Found override directory for ${{ github.event.inputs.tag }}"
+
+            echo "Files in override directory:"
+            find overrides/gpt-load/${{ github.event.inputs.tag }} -type f
+
+            echo "Applying override files..."
+            cp -r overrides/gpt-load/${{ github.event.inputs.tag }}/* upstream/
+            echo "Override files copied successfully"
+          else
+            echo "No override directory found for ${{ github.event.inputs.tag }}, proceeding with original upstream code"
+          fi
+
+      - name: Set working directory
+        run: |
+          cd upstream
+          echo "Current directory: $(pwd)"
+          echo "Files in upstream directory:"
+          ls -la
+          git diff
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./upstream
+          file: ./upstream/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.event.inputs.tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64,linux/arm64, linux/s390x
+          build-args: |
+            VERSION=${{ github.event.inputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
