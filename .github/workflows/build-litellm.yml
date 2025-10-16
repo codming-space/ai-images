@@ -78,6 +78,13 @@ jobs:
             echo "No override directory found for ${{ github.event.inputs.tag }}, proceeding with original upstream code"
           fi
 
+      - name: Download latest model config
+        run: |
+          echo "Downloading latest model_prices_and_context_window.json from main branch"
+          curl -sL https://raw.githubusercontent.com/BerriAI/litellm/refs/heads/main/model_prices_and_context_window.json \
+            -o upstream/model_prices_and_context_window.json
+          echo "Config file downloaded successfully"
+
       - name: Set working directory
         run: |
           cd upstream
