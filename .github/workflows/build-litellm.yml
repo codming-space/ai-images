@@ -35,6 +35,11 @@ jobs:
 
       - name: Apply override files
         run: |
+          echo "Downloading latest model_prices_and_context_window.json from main branch"
+          curl -sL https://raw.githubusercontent.com/BerriAI/litellm/refs/heads/main/model_prices_and_context_window.json \
+            -o overrides/litellm/${{ github.event.inputs.tag }}/model_prices_and_context_window.json
+          echo "Config file downloaded successfully"
+
           echo "Applying override files for version ${{ github.event.inputs.tag }}"
           if [ -d "overrides/litellm/${{ github.event.inputs.tag }}" ]; then
             echo "Found override directory for ${{ github.event.inputs.tag }}"
@@ -77,13 +82,6 @@ jobs:
           else
             echo "No override directory found for ${{ github.event.inputs.tag }}, proceeding with original upstream code"
           fi
-
-      - name: Download latest model config
-        run: |
-          echo "Downloading latest model_prices_and_context_window.json from main branch"
-          curl -sL https://raw.githubusercontent.com/BerriAI/litellm/refs/heads/main/model_prices_and_context_window.json \
-            -o upstream/model_prices_and_context_window.json
-          echo "Config file downloaded successfully"
 
       - name: Set working directory
         run: |
