@@ -2,7 +2,7 @@
 
 # 定义源目录和目标目录
 SOURCE_DIR=~/Project/new-api-upstream
-TARGET_DIR=~/Project/ai-images/new-api/v0.9.27-patch.1
+TARGET_DIR=~/Project/ai-images/new-api/v0.9.28
 
 # 展开波浪号
 SOURCE_DIR="${SOURCE_DIR/#\~/$HOME}"
