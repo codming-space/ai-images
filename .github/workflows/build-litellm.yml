@@ -22,14 +22,14 @@ jobs:
           echo "Building custom LiteLLM with tag: ${{ github.event.inputs.tag }}"
 
       - name: Checkout upstream LiteLLM repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: 'BerriAI/litellm'
           ref: ${{ github.event.inputs.tag }}
           path: 'upstream'
 
       - name: Checkout override files repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: 'overrides'
 
@@ -110,7 +110,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: ./upstream
           file: ./upstream/Dockerfile
@@ -120,5 +120,7 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           labels: ${{ steps.meta.outputs.labels }}
           platforms: linux/amd64,linux/arm64
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ github.workflow }}
+          cache-to: type=gha,mode=max,scope=${{ github.workflow }}
+          provenance: false
+          sbom: false
