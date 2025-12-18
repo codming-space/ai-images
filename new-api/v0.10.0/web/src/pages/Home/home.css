@@ -7,20 +7,6 @@ body:has(.sdv-home) header.sticky {
   -webkit-backdrop-filter: none !important;
 }
 
-/* 首页导航栏使用方块背景 */
-body:has(.sdv-home) header.sticky::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  z-index: -1;
-  background-color: #ffdca8;
-  background-image:
-    linear-gradient(45deg, #ffcf8f 25%, transparent 25%, transparent 75%, #ffcf8f 75%, #ffcf8f),
-    linear-gradient(45deg, #ffcf8f 25%, transparent 25%, transparent 75%, #ffcf8f 75%, #ffcf8f);
-  background-size: 40px 40px;
-  background-position: 0 0, 20px 20px;
-}
-
 /* 引入 VT323 字体 */
 @font-face {
   font-family: 'VT323';
