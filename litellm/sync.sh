@@ -2,7 +2,7 @@
 
 # 定义源目录和目标目录
 SOURCE_DIR=~/Project/litellm-upstream
-TARGET_DIR=~/Project/ai-images/litellm/v1.80.10.rc.2
+TARGET_DIR=~/Project/ai-images/litellm/v1.80.10.rc.4
 
 # 展开波浪号
 SOURCE_DIR="${SOURCE_DIR/#\~/$HOME}"
