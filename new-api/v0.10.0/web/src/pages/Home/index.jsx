@@ -20,6 +20,21 @@ For commercial licensing, please contact support@quantumnous.com
 import { useEffect, useState, useRef } from 'react';
 import './home.css';
 
+// 预加载图片，避免每次动画循环重新请求
+const preloadedImages = {};
+const preloadImage = (src) => {
+  if (!preloadedImages[src]) {
+    const img = new Image();
+    img.src = src;
+    preloadedImages[src] = src;
+  }
+  return src;
+};
+
+// 预加载所有用到的图片
+preloadImage('/Dwarf_Scroll_IV.png');
+preloadImage('/trees.png');
+
 const terminalLines = [
   { type: 'title', text: 'New Quest: Connect to IINA.AI', icon: '/Dwarf_Scroll_IV.png', delay: 800, showDivider: true },
   { type: 'blank', text: '', delay: 200 },
