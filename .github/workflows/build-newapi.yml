@@ -60,16 +60,42 @@ jobs:
       - name: Build frontend with Bun
         run: |
           cd frontend
-          ls -al
           bun install
           DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=${{ github.event.inputs.tag }} bun run build
-          cd ..
-          mv frontend/dist upstream/web
+          mv dist ../upstream/web
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache-dependency-path: upstream/go.sum
+
+      - name: Build Go binaries for all platforms
+        env:
+          CGO_ENABLED: '0'
+          GOEXPERIMENT: greenteagc
+          GOOS: linux
+        run: |
           cd upstream
-          git describe --tags > VERSION
-          cat VERSION
-          git status
-          git diff
+          echo "${{ github.event.inputs.tag }}" > VERSION
+          mkdir -p bin
+
+          echo "Building for linux/amd64..."
+          GOARCH=amd64 go build \
+            -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$(cat VERSION)'" \
+            -o bin/new-api-amd64
+
+          echo "Building for linux/arm64..."
+          GOARCH=arm64 go build \
+            -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$(cat VERSION)'" \
+            -o bin/new-api-arm64
+
+          echo "Building for linux/s390x..."
+          GOARCH=s390x go build \
+            -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$(cat VERSION)'" \
+            -o bin/new-api-s390x
+
+          ls -la bin/
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
