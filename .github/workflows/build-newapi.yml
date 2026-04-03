@@ -62,7 +62,7 @@ jobs:
       - name: Build frontend with Bun
         run: |
           cd frontend
-          bun install --frozen-lockfile
+          bun install
           DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION="$TAG" bun run build
           mv dist ../upstream/web
 
