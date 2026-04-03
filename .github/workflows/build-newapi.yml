@@ -16,58 +16,60 @@ jobs:
     permissions:
       contents: read
       packages: write
+    env:
+      TAG: ${{ github.event.inputs.tag }}
     steps:
       - name: Set up environment
         run: |
-          echo "Building custom New API with tag: ${{ github.event.inputs.tag }}"
+          echo "Building custom New API with tag: $TAG"
 
       - name: Checkout upstream New API repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: 'QuantumNous/new-api'
           ref: ${{ github.event.inputs.tag }}
           path: 'upstream'
 
       - name: Checkout override dockerfile
-        uses: actions/checkout@v6
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           path: 'overrides'
 
       - name: Apply overrides
         run: |
-          echo "Applying override files for version ${{ github.event.inputs.tag }}"
-          if [ -d "overrides/new-api/${{ github.event.inputs.tag }}" ]; then
-            echo "Found override directory for ${{ github.event.inputs.tag }}"
+          echo "Applying override files for version $TAG"
+          if [ -d "overrides/new-api/$TAG" ]; then
+            echo "Found override directory for $TAG"
 
             echo "Files in override directory:"
-            find overrides/new-api/${{ github.event.inputs.tag }} -type f
+            find "overrides/new-api/$TAG" -type f
 
             echo "Applying override files..."
-            cp -r overrides/new-api/${{ github.event.inputs.tag }}/* upstream/
+            cp -r "overrides/new-api/$TAG"/* upstream/
             echo "Override files copied successfully"
           else
-            echo "No override directory found for ${{ github.event.inputs.tag }}, proceeding with original upstream code"
+            echo "No override directory found for $TAG, proceeding with original upstream code"
           fi
 
           mkdir -p frontend
           cp -r upstream/web/* frontend/
 
       - name: Set up Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: latest
 
       - name: Build frontend with Bun
         run: |
           cd frontend
-          bun install
-          DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=${{ github.event.inputs.tag }} bun run build
+          bun install --frozen-lockfile
+          DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION="$TAG" bun run build
           mv dist ../upstream/web
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: '1.25'
+          go-version: '1.26.1'
           cache-dependency-path: upstream/go.sum
 
       - name: Build Go binaries for all platforms
@@ -77,7 +79,7 @@ jobs:
           GOOS: linux
         run: |
           cd upstream
-          echo "${{ github.event.inputs.tag }}" > VERSION
+          echo "$TAG" > VERSION
           mkdir -p bin
 
           echo "Building for linux/amd64..."
@@ -98,7 +100,7 @@ jobs:
           ls -la bin/
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -106,18 +108,18 @@ jobs:
 
       - name: Extract metadata (tags, labels) for Docker
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ${{ env.IMAGE_NAME }}
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: ./upstream
           file: ./upstream/Dockerfile
@@ -127,5 +129,5 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           labels: ${{ steps.meta.outputs.labels }}
           platforms: linux/amd64,linux/arm64,linux/s390x
-          provenance: false
-          sbom: false
+          provenance: mode=max
+          sbom: true
