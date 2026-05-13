@@ -266,6 +266,30 @@ const allColumnConfigs: ColumnConfig[] = [
       ),
   },
   {
+    key: "affinity_status",
+    title: t("logs.affinity"),
+    width: 90,
+    defaultVisible: true,
+    render: (row: LogRow) => {
+      if (!row.affinity_status) {
+        return "-";
+      }
+      const map: Record<
+        string,
+        { type: "success" | "warning" | "error" | "default"; label: string }
+      > = {
+        hit: { type: "success", label: t("logs.affinityHit") },
+        miss: { type: "default", label: t("logs.affinityMiss") },
+        unbind: { type: "warning", label: t("logs.affinityUnbind") },
+      };
+      const cfg = map[row.affinity_status];
+      if (!cfg) {
+        return "-";
+      }
+      return h(NTag, { type: cfg.type, size: "small", round: true }, { default: () => cfg.label });
+    },
+  },
+  {
     key: "status_code",
     title: t("logs.statusCode"),
     width: 130,
@@ -774,20 +798,30 @@ const deselectAllColumns = () => {
                   {{ selectedLog.is_stream ? t("logs.stream") : t("logs.nonStream") }}
                 </n-tag>
               </div>
+              <div class="detail-item-compact" v-if="selectedLog.affinity_status">
+                <span class="detail-label-compact">{{ t("logs.affinity") }}:</span>
+                <n-tag
+                  :type="
+                    selectedLog.affinity_status === 'hit'
+                      ? 'success'
+                      : selectedLog.affinity_status === 'unbind'
+                        ? 'warning'
+                        : 'default'
+                  "
+                  size="small"
+                >
+                  {{
+                    selectedLog.affinity_status === "hit"
+                      ? t("logs.affinityHit")
+                      : selectedLog.affinity_status === "miss"
+                        ? t("logs.affinityMiss")
+                        : t("logs.affinityUnbind")
+                  }}
+                </n-tag>
+              </div>
               <div class="detail-item-compact">
                 <span class="detail-label-compact">{{ t("logs.sourceIP") }}:</span>
                 <span class="detail-value-compact">{{ selectedLog.source_ip || "-" }}</span>
-              </div>
-              <div v-if="selectedLog.affinity_tier" class="detail-item-compact">
-                <span class="detail-label-compact">{{ t("logs.affinity") }}:</span>
-                <span class="detail-value-compact">
-                  <n-tag :type="selectedLog.affinity_tier === 'strict' ? 'success' : 'info'" size="small">
-                    {{ selectedLog.affinity_tier }}
-                  </n-tag>
-                  <span style="margin-left: 6px">
-                    · {{ selectedLog.affinity_hit ? t("logs.affinityHit") : t("logs.affinityNew") }}
-                  </span>
-                </span>
               </div>
               <div class="detail-item-compact key-item">
                 <span class="detail-label-compact">{{ t("logs.key") }}:</span>

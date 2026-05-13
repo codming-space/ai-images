@@ -155,9 +155,7 @@ type RequestLog struct {
 	UpstreamAddr    string    `gorm:"type:varchar(500)" json:"upstream_addr"`
 	IsStream        bool      `gorm:"not null" json:"is_stream"`
 	RequestBody     string    `gorm:"type:text" json:"request_body"`
-	// Claude 亲和路由信息。AffinityTier 为空表示该请求未触发亲和（OpenAI/Gemini 或未命中触发条件）。
-	AffinityTier string `gorm:"type:varchar(16);default:''" json:"affinity_tier"`
-	AffinityHit  bool   `gorm:"not null;default:false" json:"affinity_hit"`
+	AffinityStatus  string    `gorm:"type:varchar(20);default:''" json:"affinity_status"`
 }
 
 // StatCard 用于仪表盘的单个统计卡片数据

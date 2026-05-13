@@ -9,9 +9,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"time"
 
+	"gpt-load/internal/affinity"
 	"gpt-load/internal/channel"
 	"gpt-load/internal/config"
 	"gpt-load/internal/encryption"
@@ -20,21 +20,12 @@ import (
 	"gpt-load/internal/models"
 	"gpt-load/internal/response"
 	"gpt-load/internal/services"
+	"gpt-load/internal/store"
 	"gpt-load/internal/utils"
 
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
 )
-
-// claudeAffinityEnabled 在启动时读 CLAUDE_AFFINITY_ENABLED 环境变量。
-// 改值需要重启进程。默认关闭，避免现有部署行为变化。
-var claudeAffinityEnabled = os.Getenv("CLAUDE_AFFINITY_ENABLED") == "true"
-
-func init() {
-	if claudeAffinityEnabled {
-		logrus.Info("Claude affinity routing: ENABLED (TTL=1h, anthropic channels only)")
-	}
-}
 
 // ProxyServer represents the proxy server
 type ProxyServer struct {
@@ -45,6 +36,7 @@ type ProxyServer struct {
 	channelFactory    *channel.Factory
 	requestLogService *services.RequestLogService
 	encryptionSvc     encryption.Service
+	affinityProvider  affinity.Provider
 }
 
 // NewProxyServer creates a new proxy server
@@ -56,6 +48,7 @@ func NewProxyServer(
 	channelFactory *channel.Factory,
 	requestLogService *services.RequestLogService,
 	encryptionSvc encryption.Service,
+	affinityProvider affinity.Provider,
 ) (*ProxyServer, error) {
 	return &ProxyServer{
 		keyProvider:       keyProvider,
@@ -65,6 +58,7 @@ func NewProxyServer(
 		channelFactory:    channelFactory,
 		requestLogService: requestLogService,
 		encryptionSvc:     encryptionSvc,
+		affinityProvider:  affinityProvider,
 	}, nil
 }
 
@@ -121,32 +115,15 @@ func (ps *ProxyServer) HandleProxy(c *gin.Context) {
 
 	isStream := channelHandler.IsStreamRequest(c, bodyBytes)
 
-	// 仅对 anthropic channel + 开关开启时，计算亲和键并放入 gin context
-	if claudeAffinityEnabled && group.ChannelType == "anthropic" {
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					logrus.WithField("panic", r).Warn("Claude affinity Inspect panicked, falling back to round-robin")
-				}
-			}()
-			result := keypool.Inspect(finalBodyBytes)
-			if result.AffinityKey != "" {
-				c.Set("claude_affinity_key", result.AffinityKey)
-				c.Set("claude_affinity_tier", result.Tier)
-				logrus.WithFields(logrus.Fields{
-					"tier":     result.Tier,
-					"triggers": result.Triggers,
-					"key":      result.AffinityKey[:16],
-					"model":    result.Model,
-				}).Debug("Claude affinity key computed")
-			}
-		}()
-	}
-
-	ps.executeRequestWithRetry(c, channelHandler, originalGroup, group, finalBodyBytes, isStream, startTime, 0)
+	ps.executeRequestWithRetry(c, channelHandler, originalGroup, group, finalBodyBytes, isStream, startTime, 0, "", false)
 }
 
 // executeRequestWithRetry is the core recursive function for handling requests and retries.
+//
+// affinityFP and affinityHit are threaded through retries so that the final
+// outcome can either persist the fp->key mapping (on success) or clear a
+// poisoned mapping (on final failure). They are computed once at retryCount==0
+// and never recomputed during retries.
 func (ps *ProxyServer) executeRequestWithRetry(
 	c *gin.Context,
 	channelHandler channel.ChannelProxy,
@@ -156,40 +133,37 @@ func (ps *ProxyServer) executeRequestWithRetry(
 	isStream bool,
 	startTime time.Time,
 	retryCount int,
+	affinityFP string,
+	affinityHit bool,
 ) {
 	cfg := group.EffectiveConfig
 
 	var apiKey *models.APIKey
 	var err error
-	affinityKey := c.GetString("claude_affinity_key")
-	// 每次尝试都从 false 起步，命中后再覆写。重试帧不会继承上一帧的 true。
-	c.Set("claude_affinity_hit", false)
+	// attemptStatus tracks how affinity influenced *this* attempt, for logging.
+	// It starts empty (no affinity engagement for retries) and is set at
+	// retryCount==0 from tryAffinityKey, then possibly upgraded to "unbind"
+	// when a hit-bound key fails on this attempt.
+	attemptStatus := affinity.StatusNone
 
-	// 仅首次尝试用亲和路由；重试时跳过避免反复打到失败 key
-	if retryCount == 0 && affinityKey != "" {
-		apiKey, _ = ps.keyProvider.SelectKeyByAffinity(group.ID, affinityKey)
-		if apiKey != nil {
-			c.Set("claude_affinity_hit", true)
-			logrus.WithFields(logrus.Fields{
-				"groupID": group.ID,
-				"keyID":   apiKey.ID,
-				"key":     affinityKey[:16],
-			}).Debug("Claude affinity HIT")
-		}
+	// First attempt: try affinity. On retries we deliberately skip affinity so
+	// a failed key isn't picked again — the parent call already passes the
+	// affinityFP forward so we can still record/clear on the final outcome.
+	if retryCount == 0 {
+		newFP, hit, key, status := ps.tryAffinityKey(c, channelHandler, group, bodyBytes)
+		affinityFP = newFP
+		affinityHit = hit
+		apiKey = key
+		attemptStatus = status
 	}
 
-	// 未命中（或非首次尝试）走原本轮询
 	if apiKey == nil {
 		apiKey, err = ps.keyProvider.SelectKey(group.ID)
 		if err != nil {
 			logrus.Errorf("Failed to select a key for group %s on attempt %d: %v", group.Name, retryCount+1, err)
 			response.Error(c, app_errors.NewAPIError(app_errors.ErrNoKeysAvailable, err.Error()))
-			ps.logRequest(c, originalGroup, group, nil, startTime, http.StatusServiceUnavailable, err, isStream, "", channelHandler, bodyBytes, models.RequestTypeFinal)
+			ps.logRequest(c, originalGroup, group, nil, startTime, http.StatusServiceUnavailable, err, isStream, "", channelHandler, bodyBytes, models.RequestTypeFinal, attemptStatus)
 			return
-		}
-		// 首次轮询出的 key 写入亲和映射表（TTL 1h）
-		if retryCount == 0 && affinityKey != "" {
-			ps.keyProvider.RememberAffinity(group.ID, affinityKey, apiKey.ID, time.Hour)
 		}
 	}
 
@@ -228,7 +202,7 @@ func (ps *ProxyServer) executeRequestWithRetry(
 	finalBodyBytes, err := channelHandler.ApplyModelRedirect(req, bodyBytes, group)
 	if err != nil {
 		response.Error(c, app_errors.NewAPIError(app_errors.ErrBadRequest, err.Error()))
-		ps.logRequest(c, originalGroup, group, apiKey, startTime, http.StatusBadRequest, err, isStream, upstreamURL, channelHandler, bodyBytes, models.RequestTypeFinal)
+		ps.logRequest(c, originalGroup, group, apiKey, startTime, http.StatusBadRequest, err, isStream, upstreamURL, channelHandler, bodyBytes, models.RequestTypeFinal, attemptStatus)
 		return
 	}
 
@@ -265,7 +239,7 @@ func (ps *ProxyServer) executeRequestWithRetry(
 	if err != nil || shouldRetryByStatus {
 		if err != nil && app_errors.IsIgnorableError(err) {
 			logrus.Debugf("Client-side ignorable error for key %s, aborting retries: %v", utils.MaskAPIKey(apiKey.KeyValue), err)
-			ps.logRequest(c, originalGroup, group, apiKey, startTime, 499, err, isStream, upstreamURL, channelHandler, bodyBytes, models.RequestTypeFinal)
+			ps.logRequest(c, originalGroup, group, apiKey, startTime, 499, err, isStream, upstreamURL, channelHandler, bodyBytes, models.RequestTypeFinal, attemptStatus)
 			return
 		}
 
@@ -296,6 +270,21 @@ func (ps *ProxyServer) executeRequestWithRetry(
 		// 使用解析后的错误信息更新密钥状态
 		ps.keyProvider.UpdateStatus(apiKey, group, false, parsedError)
 
+		// If we just failed on an affinity-bound key, drop the binding
+		// immediately (don't wait for isLastAttempt). Retries pick a fresh
+		// key via plain round-robin; if the retry chain ultimately succeeds,
+		// the Record(SETNX) below will establish a new binding to the
+		// key that actually worked. Without this, SETNX would no-op on the
+		// stale mapping and future requests with the same fp would keep
+		// hitting the same failing key until it gets blacklisted.
+		if affinityHit {
+			if err := ps.affinityProvider.Delete(group.ID, affinityFP); err != nil {
+				logrus.WithError(err).Debug("affinity: delete after hit failure failed (non-fatal)")
+			}
+			affinityHit = false
+			attemptStatus = affinity.StatusUnbind
+		}
+
 		// 判断是否为最后一次尝试
 		isLastAttempt := retryCount >= cfg.MaxRetries
 		requestType := models.RequestTypeRetry
@@ -303,7 +292,7 @@ func (ps *ProxyServer) executeRequestWithRetry(
 			requestType = models.RequestTypeFinal
 		}
 
-		ps.logRequest(c, originalGroup, group, apiKey, startTime, statusCode, errors.New(parsedError), isStream, upstreamURL, channelHandler, bodyBytes, requestType)
+		ps.logRequest(c, originalGroup, group, apiKey, startTime, statusCode, errors.New(parsedError), isStream, upstreamURL, channelHandler, bodyBytes, requestType, attemptStatus)
 
 		// 如果是最后一次尝试，直接返回错误，不再递归
 		if isLastAttempt {
@@ -316,12 +305,20 @@ func (ps *ProxyServer) executeRequestWithRetry(
 			return
 		}
 
-		ps.executeRequestWithRetry(c, channelHandler, originalGroup, group, bodyBytes, isStream, startTime, retryCount+1)
+		ps.executeRequestWithRetry(c, channelHandler, originalGroup, group, bodyBytes, isStream, startTime, retryCount+1, affinityFP, affinityHit)
 		return
 	}
 
 	// ps.keyProvider.UpdateStatus(apiKey, group, true) // 请求成功不再重置成功次数，减少IO消耗
 	logrus.Debugf("Request for group %s succeeded on attempt %d with key %s", group.Name, retryCount+1, utils.MaskAPIKey(apiKey.KeyValue))
+
+	// Affinity bookkeeping on success: SETNX so we don't churn an existing
+	// mapping; a no-op when fp was already bound to a key (including this one).
+	if affinityFP != "" {
+		if err := ps.affinityProvider.Record(group.ID, affinityFP, apiKey.ID, ps.affinityTTL(group.ChannelType)); err != nil {
+			logrus.WithError(err).Debug("affinity: record failed (non-fatal)")
+		}
+	}
 
 	// Check if this is a model list request (needs special handling)
 	if shouldInterceptModelList(c.Request.URL.Path, c.Request.Method) {
@@ -341,7 +338,73 @@ func (ps *ProxyServer) executeRequestWithRetry(
 		}
 	}
 
-	ps.logRequest(c, originalGroup, group, apiKey, startTime, resp.StatusCode, nil, isStream, upstreamURL, channelHandler, bodyBytes, models.RequestTypeFinal)
+	ps.logRequest(c, originalGroup, group, apiKey, startTime, resp.StatusCode, nil, isStream, upstreamURL, channelHandler, bodyBytes, models.RequestTypeFinal, attemptStatus)
+}
+
+// tryAffinityKey attempts to resolve an affinity-bound key for the current
+// request. Returns (fp, hit, key, status):
+//   - fp == "": the request does not qualify for affinity (no fingerprinter,
+//     disabled, model/path mismatch, empty first_user_text, etc.). The caller
+//     should fall through to plain round-robin. status is affinity.StatusNone.
+//   - fp != "", key != nil: a previously bound key was found and is still
+//     active. hit is true, status is affinity.StatusHit.
+//   - fp != "", key == nil: the request qualifies but either has no binding
+//     yet (status=StatusMiss), or had a binding pointing to a now-invalid key
+//     in which case the stale mapping has been deleted (status=StatusUnbind).
+//     The caller should fall through to round-robin; on success the fp will
+//     be recorded against the picked key.
+func (ps *ProxyServer) tryAffinityKey(
+	c *gin.Context,
+	channelHandler channel.ChannelProxy,
+	group *models.Group,
+	bodyBytes []byte,
+) (string, bool, *models.APIKey, string) {
+	if ps.affinityProvider == nil {
+		return "", false, nil, affinity.StatusNone
+	}
+	fp, ok := ps.affinityProvider.Fingerprinter(group.ChannelType)
+	if !ok || !fp.Enabled() {
+		return "", false, nil, affinity.StatusNone
+	}
+	model := channelHandler.ExtractModel(c, bodyBytes)
+	fingerprint, matched := fp.Compute(model, c.Request.URL.Path, bodyBytes)
+	if !matched {
+		return "", false, nil, affinity.StatusNone
+	}
+
+	keyID, found := ps.affinityProvider.Lookup(group.ID, fingerprint)
+	if !found {
+		return fingerprint, false, nil, affinity.StatusMiss
+	}
+
+	key, err := ps.keyProvider.GetKeyByID(keyID)
+	if err != nil || key == nil || key.Status != models.KeyStatusActive || key.GroupID != group.ID {
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			logrus.WithError(err).Debug("affinity: GetKeyByID failed, treating as miss")
+		}
+		// Stale binding: clear so the next request can rebind to a fresh key.
+		if delErr := ps.affinityProvider.Delete(group.ID, fingerprint); delErr != nil {
+			logrus.WithError(delErr).Debug("affinity: delete stale mapping failed (non-fatal)")
+		}
+		return fingerprint, false, nil, affinity.StatusUnbind
+	}
+
+	logrus.Debugf("affinity hit: group=%s fp=%s key=%s", group.Name, fingerprint, utils.MaskAPIKey(key.KeyValue))
+	return fingerprint, true, key, affinity.StatusHit
+}
+
+// affinityTTL returns the Fingerprinter's configured TTL for the given channel
+// type, or a zero duration if no fingerprinter is registered (in which case
+// callers wouldn't have a non-empty fp anyway).
+func (ps *ProxyServer) affinityTTL(channelType string) time.Duration {
+	if ps.affinityProvider == nil {
+		return 0
+	}
+	fp, ok := ps.affinityProvider.Fingerprinter(channelType)
+	if !ok {
+		return 0
+	}
+	return fp.TTL()
 }
 
 func shouldFailoverOnStatusCode(statusCode int, group *models.Group) bool {
@@ -365,6 +428,7 @@ func (ps *ProxyServer) logRequest(
 	channelHandler channel.ChannelProxy,
 	bodyBytes []byte,
 	requestType string,
+	affinityStatus string,
 ) {
 	if ps.requestLogService == nil {
 		return
@@ -380,20 +444,19 @@ func (ps *ProxyServer) logRequest(
 	duration := time.Since(startTime).Milliseconds()
 
 	logEntry := &models.RequestLog{
-		GroupID:      group.ID,
-		GroupName:    group.Name,
-		IsSuccess:    finalError == nil && statusCode < 400,
-		SourceIP:     c.ClientIP(),
-		StatusCode:   statusCode,
-		RequestPath:  utils.TruncateString(c.Request.URL.String(), 500),
-		Duration:     duration,
-		UserAgent:    userAgent,
-		RequestType:  requestType,
-		IsStream:     isStream,
-		UpstreamAddr: utils.TruncateString(upstreamAddr, 500),
-		RequestBody:  requestBodyToLog,
-		AffinityTier: c.GetString("claude_affinity_tier"),
-		AffinityHit:  c.GetBool("claude_affinity_hit"),
+		GroupID:        group.ID,
+		GroupName:      group.Name,
+		IsSuccess:      finalError == nil && statusCode < 400,
+		SourceIP:       c.ClientIP(),
+		StatusCode:     statusCode,
+		RequestPath:    utils.TruncateString(c.Request.URL.String(), 500),
+		Duration:       duration,
+		UserAgent:      userAgent,
+		RequestType:    requestType,
+		IsStream:       isStream,
+		UpstreamAddr:   utils.TruncateString(upstreamAddr, 500),
+		RequestBody:    requestBodyToLog,
+		AffinityStatus: affinityStatus,
 	}
 
 	// Set parent group

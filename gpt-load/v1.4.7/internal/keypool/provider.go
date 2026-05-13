@@ -52,18 +52,34 @@ func (p *KeyProvider) SelectKey(groupID uint) (*models.APIKey, error) {
 		return nil, fmt.Errorf("failed to parse key ID '%s': %w", keyIDStr, err)
 	}
 
-	// 2. Get key details from HASH
+	return p.loadKeyByID(uint(keyID))
+}
+
+// GetKeyByID directly fetches an APIKey by its numeric ID without rotating
+// the active-keys list. Used by the affinity layer to materialize a key that
+// was previously bound to a request fingerprint. Returns store.ErrNotFound
+// when the key has been removed from the store (deleted or migrated).
+func (p *KeyProvider) GetKeyByID(keyID uint) (*models.APIKey, error) {
+	return p.loadKeyByID(keyID)
+}
+
+// loadKeyByID reads an APIKey from the store hash. Shared by SelectKey and
+// GetKeyByID so the decoding (and the fallback for legacy unencrypted values)
+// stays in one place.
+func (p *KeyProvider) loadKeyByID(keyID uint) (*models.APIKey, error) {
 	keyHashKey := fmt.Sprintf("key:%d", keyID)
 	keyDetails, err := p.store.HGetAll(keyHashKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get key details for key ID %d: %w", keyID, err)
 	}
+	if len(keyDetails) == 0 || keyDetails["id"] == "" {
+		return nil, store.ErrNotFound
+	}
 
-	// 3. Manually unmarshal the map into an APIKey struct
 	failureCount, _ := strconv.ParseInt(keyDetails["failure_count"], 10, 64)
 	createdAt, _ := strconv.ParseInt(keyDetails["created_at"], 10, 64)
+	groupID, _ := strconv.ParseUint(keyDetails["group_id"], 10, 64)
 
-	// Decrypt the key value for use by channels
 	encryptedKeyValue := keyDetails["key_string"]
 	decryptedKeyValue, err := p.encryptionSvc.Decrypt(encryptedKeyValue)
 	if err != nil {
@@ -75,16 +91,14 @@ func (p *KeyProvider) SelectKey(groupID uint) (*models.APIKey, error) {
 		decryptedKeyValue = encryptedKeyValue
 	}
 
-	apiKey := &models.APIKey{
-		ID:           uint(keyID),
+	return &models.APIKey{
+		ID:           keyID,
 		KeyValue:     decryptedKeyValue,
 		Status:       keyDetails["status"],
 		FailureCount: failureCount,
-		GroupID:      groupID,
+		GroupID:      uint(groupID),
 		CreatedAt:    time.Unix(createdAt, 0),
-	}
-
-	return apiKey, nil
+	}, nil
 }
 
 // UpdateStatus 异步地提交一个 Key 状态更新任务。
@@ -647,75 +661,4 @@ func pluckIDs(keys []models.APIKey) []uint {
 		ids[i] = key.ID
 	}
 	return ids
-}
-
-// SelectKeyByAffinity 按亲和键查 group 内的固定 key。
-// 命中且 key 仍为 active 则返回；映射不存在 / key 已黑名单 / 解码失败均返回 nil。
-// 返回 nil 时调用方应 fallback 走 SelectKey（轮询）。
-func (p *KeyProvider) SelectKeyByAffinity(groupID uint, affinityKey string) (*models.APIKey, error) {
-	if affinityKey == "" {
-		return nil, nil
-	}
-
-	cacheKey := fmt.Sprintf("affinity:claude:group:%d:hash:%s", groupID, affinityKey)
-
-	keyIDBytes, err := p.store.Get(cacheKey)
-	if err != nil || len(keyIDBytes) == 0 {
-		return nil, nil
-	}
-
-	keyID, err := strconv.ParseUint(string(keyIDBytes), 10, 64)
-	if err != nil {
-		return nil, nil
-	}
-
-	keyHashKey := fmt.Sprintf("key:%d", keyID)
-	keyDetails, err := p.store.HGetAll(keyHashKey)
-	if err != nil || len(keyDetails) == 0 {
-		return nil, nil
-	}
-
-	if keyDetails["status"] != models.KeyStatusActive {
-		return nil, nil
-	}
-
-	failureCount, _ := strconv.ParseInt(keyDetails["failure_count"], 10, 64)
-	createdAt, _ := strconv.ParseInt(keyDetails["created_at"], 10, 64)
-
-	encryptedKeyValue := keyDetails["key_string"]
-	decryptedKeyValue, err := p.encryptionSvc.Decrypt(encryptedKeyValue)
-	if err != nil {
-		decryptedKeyValue = encryptedKeyValue
-	}
-
-	return &models.APIKey{
-		ID:           uint(keyID),
-		KeyValue:     decryptedKeyValue,
-		Status:       keyDetails["status"],
-		FailureCount: failureCount,
-		GroupID:      groupID,
-		CreatedAt:    time.Unix(createdAt, 0),
-	}, nil
-}
-
-// RememberAffinity 把 (affinityKey → keyID) 映射写入 store。
-// 后续 TTL 时间内同 affinityKey 的请求都会路由到同一个 key。
-func (p *KeyProvider) RememberAffinity(groupID uint, affinityKey string, keyID uint, ttl time.Duration) {
-	if affinityKey == "" {
-		return
-	}
-	cacheKey := fmt.Sprintf("affinity:claude:group:%d:hash:%s", groupID, affinityKey)
-	value := []byte(strconv.FormatUint(uint64(keyID), 10))
-	if err := p.store.Set(cacheKey, value, ttl); err != nil {
-		keyPrefixLen := 16
-		if len(affinityKey) < keyPrefixLen {
-			keyPrefixLen = len(affinityKey)
-		}
-		logrus.WithFields(logrus.Fields{
-			"groupID":     groupID,
-			"affinityKey": affinityKey[:keyPrefixLen],
-			"keyID":       keyID,
-			"error":       err,
-		}).Warn("Failed to remember claude affinity mapping")
-	}
 }

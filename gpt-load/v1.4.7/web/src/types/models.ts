@@ -167,8 +167,7 @@ export interface RequestLog {
   upstream_addr: string;
   is_stream: boolean;
   request_body?: string;
-  affinity_tier?: string;
-  affinity_hit?: boolean;
+  affinity_status?: "" | "miss" | "hit" | "unbind";
 }
 
 export interface Pagination {
