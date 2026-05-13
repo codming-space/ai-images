@@ -480,6 +480,7 @@ export default {
     affinityHit: "Hit",
     affinityMiss: "Miss",
     affinityUnbind: "Unbind",
+    affinitySkip: "Skip",
     exportLogs: "Export Keys",
     totalRecords: "Total {total} records",
     recordsPerPage: "{count} per page",

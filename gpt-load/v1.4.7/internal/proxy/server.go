@@ -372,7 +372,11 @@ func (ps *ProxyServer) tryAffinityKey(
 	// while the fingerprinter expects the upstream path "/v1/messages".
 	fingerprint, matched := fp.Compute(model, c.Param("path"), bodyBytes)
 	if !matched {
-		return "", false, nil, affinity.StatusNone
+		// The channel supports affinity but this particular request didn't
+		// qualify (path mismatch / no cache_control / empty first_user / ...).
+		// Distinct from StatusNone so the UI can tell "didn't qualify" apart
+		// from "channel doesn't participate at all".
+		return "", false, nil, affinity.StatusSkip
 	}
 
 	keyID, found := ps.affinityProvider.Lookup(group.ID, fingerprint)

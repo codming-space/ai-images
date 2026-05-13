@@ -464,6 +464,7 @@ export default {
     affinityHit: "命中",
     affinityMiss: "未命中",
     affinityUnbind: "解绑",
+    affinitySkip: "跳过",
     exportLogs: "导出密钥",
     totalRecords: "共 {total} 条记录",
     recordsPerPage: "{count}条/页",

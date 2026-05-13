@@ -219,12 +219,70 @@ op:    SET NX EX（先到先得）
 
 | 值 | 含义 | UI |
 |---|---|---|
-| `""` | 未启用 / 非 Claude / 不满足资格 | 显示 `-` |
-| `miss` | 未命中（如果请求成功，已写入新映射）| default chip |
-| `hit` | 命中已有映射并使用该 key | success chip |
-| `unbind` | 命中后失败或失效，已删除映射 | warning chip |
+| `""` | 与亲和无关：非 Anthropic channel，或亲和功能关闭 | 显示 `-` |
+| `skip` | 属于亲和范围但本请求被跳过（如客户端未启用 prompt cache） | "跳过" chip (info) |
+| `miss` | 满足条件但 Redis 未命中（首次请求 / TTL 过期）| "未命中" chip (default) |
+| `hit` | 命中已有映射并使用该 key | "命中" chip (success) |
+| `unbind` | 命中后失败或失效，已删除映射 | "解绑" chip (warning) |
 
 注意状态是**每次 attempt** 一条：重试场景下，首次可能是 `hit→unbind`，重试那条是空（重试时不查亲和）。这样能在日志里看到完整的 attempt 链。
+
+### 每个值什么时候出现
+
+#### `""`（显示 `-`）
+
+请求**与亲和无关**——这个 channel 整个都不参与亲和流程：
+
+- group 的 `channel_type` 不是 `anthropic`（OpenAI / Gemini 等永远是这个值）
+- `CLAUDE_AFFINITY_ENABLED=false`（或未设置）
+- 这是一次**重试 attempt**（`retryCount > 0`，按设计跳过亲和）
+
+OpenAI / Gemini 的请求永远是这个值。重试 attempt 也是。
+
+#### `skip`
+
+请求**属于亲和支持的 channel**（anthropic）且亲和已启用，**但本请求不满足资格**，所以没参与亲和。常见原因：
+
+- **请求未启用 prompt cache**——四个位置都没 `cache_control`（最常见。客户端如果不主动启用 cache，做亲和也没意义）
+- model 不匹配 `^claude-.*$`（极少见，自定义 model 名时可能出现）
+- 上游 path 不是 `/v1/messages`
+- body 不是合法 JSON
+- messages 第一条 user 没有 text 块（纯图像 / 纯工具回合首请求）
+
+看到 `skip` 说明**客户端那边没用 cache_control**（或其他门控原因）。如果想让这些请求享受亲和，需要客户端配合开启 prompt cache。
+
+#### `miss`
+
+请求**满足全部亲和条件**，但 Redis 里**没找到** fp → key_id 映射，所以走了普通轮询。常见场景：
+
+- **新会话的首次请求**——最常见。相同 system+tools+first_user 的指纹之前没出现过 → miss → 这次成功后建立映射 → **下一次相同会话变 hit**
+- **TTL 过期**：之前命中过，但映射过了 `CLAUDE_AFFINITY_TTL`（默认 3600 秒）被 Redis 自然过期
+- **上一次相同 fp 请求失败导致 Delete**：本轮再来时映射已不存在
+- **客户端开了新对话**：first_user_text 变了 → 指纹变了 → 找不到旧映射
+
+`miss` 是**正常状态**。理想轨迹：`miss(第一次) → hit → hit → ...` 直到 TTL 过期或失败。
+
+> **异常情况**：如果两次**完全相同**的请求连续都是 miss → miss，可能是 Redis 没存上、或两次 body 字节有差异。可在日志详情对比两次 `request_body`（需要 group 开启"记录请求体"）。
+
+#### `hit`
+
+成功用上了之前绑定的 key——这次请求**很可能享受到 Claude prompt cache 折扣**（前提是服务端那边 cache TTL 还在 5 分钟窗口内）。这是亲和功能"工作中"的状态。
+
+#### `unbind`
+
+映射在这次 attempt 中被主动删除。两种触发：
+
+- **命中但 key 已失效**（`tryAffinityKey` 内）：fp 对应的 key 已被拉黑 / 删除 / 跨 group → 主动清掉 stale 映射，本次请求回退到轮询
+- **命中后请求失败**（失败响应处理）：本次 attempt 把命中的 key 用了一次但失败 → 立刻清掉绑定，避免下次同 fp 请求继续踩坑
+
+`unbind` 后通常配合重试链运作：本次 attempt 是 `unbind` + 失败，下一次重试 attempt 是空（retry 不查亲和），如果重试成功还会 `Record(SETNX)` 建立新映射，下个相同 fp 请求又能 `hit`。
+
+### 区分 `-` 和 `skip` 的意义
+
+|  | `-` | `skip` |
+|---|---|---|
+| 看到时第一反应 | "这是 OpenAI / Gemini，跟亲和无关" | "这是 Claude 请求，但客户端没用 cache_control" |
+| 是否需要排查 | 不需要 | 取决于业务预期：如果你期望客户端用 cache，看到 skip 就说明客户端没配置好 |
 
 ## 扩展（OpenAI / Gemini）
 

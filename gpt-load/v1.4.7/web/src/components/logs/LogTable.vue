@@ -290,11 +290,12 @@ const allColumnConfigs: ColumnConfig[] = [
       }
       const map: Record<
         string,
-        { type: "success" | "warning" | "error" | "default"; label: string }
+        { type: "success" | "warning" | "error" | "default" | "info"; label: string }
       > = {
         hit: { type: "success", label: t("logs.affinityHit") },
         miss: { type: "default", label: t("logs.affinityMiss") },
         unbind: { type: "warning", label: t("logs.affinityUnbind") },
+        skip: { type: "info", label: t("logs.affinitySkip") },
       };
       const cfg = map[row.affinity_status];
       if (!cfg) {
@@ -820,7 +821,9 @@ const deselectAllColumns = () => {
                       ? 'success'
                       : selectedLog.affinity_status === 'unbind'
                         ? 'warning'
-                        : 'default'
+                        : selectedLog.affinity_status === 'skip'
+                          ? 'info'
+                          : 'default'
                   "
                   size="small"
                 >
@@ -829,7 +832,9 @@ const deselectAllColumns = () => {
                       ? t("logs.affinityHit")
                       : selectedLog.affinity_status === "miss"
                         ? t("logs.affinityMiss")
-                        : t("logs.affinityUnbind")
+                        : selectedLog.affinity_status === "skip"
+                          ? t("logs.affinitySkip")
+                          : t("logs.affinityUnbind")
                   }}
                 </n-tag>
               </div>

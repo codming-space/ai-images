@@ -19,10 +19,17 @@ import (
 // layer's point of view. Exposed via RequestLog.AffinityStatus so operators
 // can spot-check hit rates and re-binding behavior in the admin UI.
 const (
-	// StatusNone — request did not engage the affinity layer (no Fingerprinter
-	// registered, disabled, or Compute returned matched=false). Stored as ""
-	// so existing rows / non-Claude channels naturally fall in this bucket.
+	// StatusNone — request is *outside the affinity surface*: no Fingerprinter
+	// registered for this channel_type (e.g. OpenAI/Gemini requests) or the
+	// feature is globally disabled. Stored as "" so existing rows / non-Claude
+	// channels naturally fall in this bucket.
 	StatusNone = ""
+	// StatusSkip — request *belongs* to a channel that supports affinity, but
+	// this particular request did not qualify (e.g. wrong path, no
+	// cache_control, empty first_user). Distinct from StatusNone so the UI
+	// can tell "request didn't meet the criteria" apart from "channel doesn't
+	// participate in affinity at all".
+	StatusSkip = "skip"
 	// StatusMiss — request qualified for affinity but no prior binding was
 	// found. If the request succeeds, a binding will be recorded.
 	StatusMiss = "miss"

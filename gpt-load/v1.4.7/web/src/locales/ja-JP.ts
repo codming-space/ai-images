@@ -481,6 +481,7 @@ export default {
     affinityHit: "ヒット",
     affinityMiss: "ミス",
     affinityUnbind: "解除",
+    affinitySkip: "スキップ",
     exportLogs: "キーのエクスポート",
     totalRecords: "合計 {total} 件",
     recordsPerPage: "{count}件/ページ",
