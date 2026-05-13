@@ -367,7 +367,10 @@ func (ps *ProxyServer) tryAffinityKey(
 		return "", false, nil, affinity.StatusNone
 	}
 	model := channelHandler.ExtractModel(c, bodyBytes)
-	fingerprint, matched := fp.Compute(model, c.Request.URL.Path, bodyBytes)
+	// Use c.Param("path") rather than c.Request.URL.Path: the proxy route is
+	// "/proxy/:group_name/*path", so URL.Path is "/proxy/claude/v1/messages"
+	// while the fingerprinter expects the upstream path "/v1/messages".
+	fingerprint, matched := fp.Compute(model, c.Param("path"), bodyBytes)
 	if !matched {
 		return "", false, nil, affinity.StatusNone
 	}

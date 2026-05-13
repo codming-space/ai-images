@@ -38,7 +38,7 @@ CLAUDE_AFFINITY_TTL=3600         # 映射 TTL（秒），默认 1 小时
 
 - `group.ChannelType == "anthropic"`
 - `model` 匹配正则 `^claude-.*$`
-- `path` 精确等于 `/v1/messages`
+- `path`（指的是去掉 `/proxy/{group_name}` 前缀后的**上游路径**，即 `c.Param("path")`）精确等于 `/v1/messages`
 - body 是合法 JSON
 - 请求**显式启用了 prompt cache**（详见下方"前提：必须启用 prompt cache"）
 - `messages` 第一条 `role=user` 且包含至少一个 `type=text` 块（详见"边界处理"）

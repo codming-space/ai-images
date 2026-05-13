@@ -191,7 +191,21 @@ const loadColumnPreferences = () => {
   const saved = localStorage.getItem(STORAGE_KEY);
   if (saved) {
     try {
-      visibleColumns.value = JSON.parse(saved);
+      const savedKeys: string[] = JSON.parse(saved);
+      const savedSet = new Set(savedKeys);
+      // Merge in any newly-added columns that ship with defaultVisible=true so
+      // a localStorage entry written before the column existed doesn't hide
+      // the new column forever. Users can still toggle them off later.
+      const merged = [...savedKeys];
+      for (const col of allColumnConfigs) {
+        if (col.alwaysVisible) {
+          continue;
+        }
+        if (col.defaultVisible && !savedSet.has(col.key)) {
+          merged.push(col.key);
+        }
+      }
+      visibleColumns.value = merged;
     } catch {
       // If parse fails, use defaults
       setDefaultColumns();
