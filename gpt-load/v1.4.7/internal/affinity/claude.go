@@ -227,13 +227,20 @@ func canonicalTools(raw json.RawMessage) string {
 			typ:         decodeJSONString(t["type"]),
 		})
 	}
-	// Tiebreak by type so two server tools sharing a name (rare, but
-	// defensive) sort deterministically.
+	// Sort by (name, type, description). The full triple is the tiebreak
+	// chain because sort.Slice is not stable: any pair of entries that the
+	// comparator reports as equal can appear in either order across runs.
+	// In the realistic case all names are distinct and the secondary keys
+	// never fire; the chain only matters for malformed inputs (e.g. two
+	// tools with the same name) where it keeps the fingerprint deterministic.
 	sort.Slice(defs, func(i, j int) bool {
 		if defs[i].name != defs[j].name {
 			return defs[i].name < defs[j].name
 		}
-		return defs[i].typ < defs[j].typ
+		if defs[i].typ != defs[j].typ {
+			return defs[i].typ < defs[j].typ
+		}
+		return defs[i].description < defs[j].description
 	})
 
 	var sb strings.Builder

@@ -319,6 +319,39 @@ func TestClaude_Fingerprint_IgnoresInputSchema(t *testing.T) {
 	}
 }
 
+// Tools must canonicalize deterministically even when multiple entries share
+// the same (name, type) prefix. sort.Slice is unstable for equal keys, so the
+// comparator chains down to description; without that, malformed inputs with
+// duplicate-named tools would produce non-deterministic fingerprints across
+// runs. Realistic clients won't hit this, but the fingerprint must not depend
+// on Go's sort behavior for ties.
+func TestClaude_Fingerprint_StableWhenToolsSharePrefix(t *testing.T) {
+	f := &ClaudeFingerprinter{enabled: true, ttl: time.Hour}
+
+	orderA := withCC(`{
+        "model": "claude-sonnet-4-5",
+        "tools": [
+            {"name":"x","description":"alpha"},
+            {"name":"x","description":"beta"}
+        ],
+        "messages": [{"role":"user","content":"hi"}]
+    }`)
+	orderB := withCC(`{
+        "model": "claude-sonnet-4-5",
+        "tools": [
+            {"name":"x","description":"beta"},
+            {"name":"x","description":"alpha"}
+        ],
+        "messages": [{"role":"user","content":"hi"}]
+    }`)
+
+	fp1, _ := f.Compute("claude-sonnet-4-5", "/v1/messages", orderA)
+	fp2, _ := f.Compute("claude-sonnet-4-5", "/v1/messages", orderB)
+	if fp1 != fp2 {
+		t.Fatalf("fp must be stable for duplicate-named tools regardless of array order:\n  fp1=%s\n  fp2=%s", fp1, fp2)
+	}
+}
+
 // Each of (name, description, type) is read via decodeJSONString, which
 // returns "" for: missing key, JSON null, empty string, and any non-string
 // type. All these forms must collapse to the same fingerprint so that a

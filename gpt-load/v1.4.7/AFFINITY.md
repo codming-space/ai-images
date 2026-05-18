@@ -60,7 +60,7 @@ KV 之间用 `\x00` 分键值、`\x01` 分项，避免拼接歧义。
 |---|---|
 | `model` | 直接用 `channelHandler.ExtractModel(c, bodyBytes)` 提取的字符串 |
 | `system` | string 直接用；array 只取 `type=text` 块 `\n` 拼接；**剔除 cache_control** |
-| `tools` | 每个 tool 取 `(name, description, type)` 三元组；**按 (name, type) 升序**（避免数组顺序影响）；`\x1f` 分字段 `\x1e` 分工具；**剔除 cache_control**；**不抓 `input_schema`**（见下"为什么不抓 input_schema"）|
+| `tools` | 每个 tool 取 `(name, description, type)` 三元组；**按 (name, type, description) 升序**（避免数组顺序影响，三级 tiebreak 防 `sort.Slice` 不稳定）；`\x1f` 分字段 `\x1e` 分工具；**剔除 cache_control**；**不抓 `input_schema`**（见下"为什么不抓 input_schema"）|
 | `first_user_text` | 第一条 `role=user` 的 content：string 直接用；array 只取 `type=text` 块 `\n` 拼接 |
 
 ### 为什么不抓 input_schema
