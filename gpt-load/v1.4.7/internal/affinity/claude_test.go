@@ -262,6 +262,108 @@ func TestClaude_Fingerprint_NonEmptyDiffersFromEmpty(t *testing.T) {
 	}
 }
 
+// Server tools (computer use, bash, text editor, web search) carry a `type`
+// field that distinguishes versions — e.g. computer_20241022 vs
+// computer_20250124 share name="computer" but are different upstream tools
+// and trigger cache invalidation when swapped. The fingerprint must reflect
+// the type so a version bump rebinds to a fresh key rather than silently
+// reusing the old binding.
+func TestClaude_Fingerprint_ServerToolVersionDiffers(t *testing.T) {
+	f := &ClaudeFingerprinter{enabled: true, ttl: time.Hour}
+
+	v1 := withCC(`{
+        "model": "claude-sonnet-4-5",
+        "tools": [{"type":"computer_20241022","name":"computer"}],
+        "messages": [{"role":"user","content":"hi"}]
+    }`)
+	v2 := withCC(`{
+        "model": "claude-sonnet-4-5",
+        "tools": [{"type":"computer_20250124","name":"computer"}],
+        "messages": [{"role":"user","content":"hi"}]
+    }`)
+
+	fp1, ok1 := f.Compute("claude-sonnet-4-5", "/v1/messages", v1)
+	fp2, ok2 := f.Compute("claude-sonnet-4-5", "/v1/messages", v2)
+	if !ok1 || !ok2 {
+		t.Fatalf("expected both to match: ok1=%v ok2=%v", ok1, ok2)
+	}
+	if fp1 == fp2 {
+		t.Fatal("server tool version bump must change fp (computer_20241022 vs computer_20250124)")
+	}
+}
+
+// input_schema is intentionally not part of the fingerprint, because its
+// raw-byte representation depends on the client's JSON serializer. Two
+// requests sharing (name, description, type) but differing in input_schema
+// must collide on the same affinity key. The trade-off is documented in
+// canonicalTools: we route similar requests to the same key and let the
+// upstream prompt cache decide actual hit/miss on byte equality.
+func TestClaude_Fingerprint_IgnoresInputSchema(t *testing.T) {
+	f := &ClaudeFingerprinter{enabled: true, ttl: time.Hour}
+
+	schemaA := withCC(`{
+        "model": "claude-sonnet-4-5",
+        "tools": [{"name":"x","description":"d","input_schema":{"type":"object","properties":{"a":{"type":"string"}}}}],
+        "messages": [{"role":"user","content":"hi"}]
+    }`)
+	schemaB := withCC(`{
+        "model": "claude-sonnet-4-5",
+        "tools": [{"name":"x","description":"d","input_schema":{"type":"object","properties":{"b":{"type":"integer"}}}}],
+        "messages": [{"role":"user","content":"hi"}]
+    }`)
+
+	fp1, _ := f.Compute("claude-sonnet-4-5", "/v1/messages", schemaA)
+	fp2, _ := f.Compute("claude-sonnet-4-5", "/v1/messages", schemaB)
+	if fp1 != fp2 {
+		t.Fatalf("input_schema must not affect fp:\n  fp1=%s\n  fp2=%s", fp1, fp2)
+	}
+}
+
+// Each of (name, description, type) is read via decodeJSONString, which
+// returns "" for: missing key, JSON null, empty string, and any non-string
+// type. All these forms must collapse to the same fingerprint so that a
+// tool spelled `{}` or `{"name":""}` or `{"name":null,"type":null}` are
+// indistinguishable — otherwise small client-side serialization differences
+// would fragment the affinity bucket.
+func TestClaude_Fingerprint_ToolFieldEmptyForms(t *testing.T) {
+	f := &ClaudeFingerprinter{enabled: true, ttl: time.Hour}
+
+	wrap := func(toolJSON string) []byte {
+		return withCC(`{
+            "model": "claude-sonnet-4-5",
+            "tools": [` + toolJSON + `],
+            "messages": [{"role":"user","content":"hi"}]
+        }`)
+	}
+
+	cases := []struct {
+		name string
+		tool string
+	}{
+		{"empty object", `{}`},
+		{"all keys null", `{"name":null,"description":null,"type":null}`},
+		{"all keys empty string", `{"name":"","description":"","type":""}`},
+		{"name only, empty string", `{"name":""}`},
+		{"non-string description", `{"description":123}`},
+		{"non-string type", `{"type":{"nested":"object"}}`},
+	}
+
+	var canonical string
+	for i, tc := range cases {
+		fp, ok := f.Compute("claude-sonnet-4-5", "/v1/messages", wrap(tc.tool))
+		if !ok {
+			t.Fatalf("[%s] expected matched=true", tc.name)
+		}
+		if i == 0 {
+			canonical = fp
+			continue
+		}
+		if fp != canonical {
+			t.Fatalf("[%s] fp differs from canonical empty form:\n  got=%s\n  want=%s", tc.name, fp, canonical)
+		}
+	}
+}
+
 // Only requests that opt into prompt caching (somewhere) qualify for
 // affinity. Without any cache_control there is no upstream cache to preserve,
 // so we want the request to fall back to pure round-robin.

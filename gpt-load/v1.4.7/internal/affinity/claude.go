@@ -181,12 +181,39 @@ func normalizedSystem(raw json.RawMessage) string {
 type toolDef struct {
 	name        string
 	description string
-	schema      string
+	typ         string
 }
 
 // canonicalTools reduces the tools array to a deterministic representation:
-// sorted by name, cache_control stripped. Tools form part of the "session
-// identity" because changing them invalidates the entire upstream prompt cache.
+// sorted by (name, type), cache_control stripped. Tools form part of the
+// "session identity" because changing them invalidates the upstream prompt
+// cache. Missing fields are treated as empty strings.
+//
+// We deliberately capture only (name, description, type) and drop
+// `input_schema`. input_schema is a nested JSON object whose *byte-level*
+// representation depends on the client's JSON serializer — key ordering,
+// whitespace, escaping. Using its raw bytes as part of the hash would make
+// the fingerprint drift across clients producing equivalent-but-not-byte-
+// identical JSON, defeating affinity for the very requests it's meant to
+// keep on the same key.
+//
+// The trade-off: two distinct tools sharing the same (name, description,
+// type) but different schemas collide on the same affinity key. That's
+// acceptable — affinity only routes "similar enough" requests to the same
+// upstream key; whether the prompt cache *actually* hits is decided by
+// Anthropic on its side, based on full byte equality of the request. A
+// false-positive affinity match at worst writes a fresh cache on the bound
+// workspace, which is strictly better than rotating to a new workspace.
+//
+// `type` is captured to distinguish *server tool versions* — e.g.
+// `{"type": "computer_20241022", "name": "computer"}` vs
+// `{"type": "computer_20250124", "name": "computer"}` share a name but are
+// different upstream tools (a major version bump invalidates the cache).
+// Observed Claude Code traffic only contains client tools, where `type` is
+// absent and this field is the empty string; the cost is one extra empty
+// slot per tool. The field exists so that server-tool users (computer use,
+// bash, text editor, web search) don't all collapse onto a single binding
+// when they upgrade tool versions.
 func canonicalTools(raw json.RawMessage) string {
 	tools, err := decodeRawBlocks(raw)
 	if err != nil {
@@ -197,10 +224,17 @@ func canonicalTools(raw json.RawMessage) string {
 		defs = append(defs, toolDef{
 			name:        decodeJSONString(t["name"]),
 			description: decodeJSONString(t["description"]),
-			schema:      string(bytes.TrimSpace(t["input_schema"])),
+			typ:         decodeJSONString(t["type"]),
 		})
 	}
-	sort.Slice(defs, func(i, j int) bool { return defs[i].name < defs[j].name })
+	// Tiebreak by type so two server tools sharing a name (rare, but
+	// defensive) sort deterministically.
+	sort.Slice(defs, func(i, j int) bool {
+		if defs[i].name != defs[j].name {
+			return defs[i].name < defs[j].name
+		}
+		return defs[i].typ < defs[j].typ
+	})
 
 	var sb strings.Builder
 	for _, d := range defs {
@@ -208,7 +242,7 @@ func canonicalTools(raw json.RawMessage) string {
 		sb.WriteByte(0x1f)
 		sb.WriteString(d.description)
 		sb.WriteByte(0x1f)
-		sb.WriteString(d.schema)
+		sb.WriteString(d.typ)
 		sb.WriteByte(0x1e)
 	}
 	return sb.String()
@@ -216,7 +250,8 @@ func canonicalTools(raw json.RawMessage) string {
 
 // firstUserText returns the concatenated text from the first role=user message.
 // If content is a string it is returned verbatim; if it is an array, only
-// type=text blocks are joined with '\n'. image / tool_result blocks are ignored.
+// type=text blocks are joined with '\n'. Non-text blocks (image, document,
+// tool_result, search_result, etc.) are ignored.
 func firstUserText(raw json.RawMessage) string {
 	msgs, err := decodeRawBlocks(raw)
 	if err != nil {
