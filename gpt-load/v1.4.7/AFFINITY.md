@@ -59,9 +59,35 @@ KV 之间用 `\x00` 分键值、`\x01` 分项，避免拼接歧义。
 | 字段 | 处理 |
 |---|---|
 | `model` | 直接用 `channelHandler.ExtractModel(c, bodyBytes)` 提取的字符串 |
-| `system` | string 直接用；array 只取 `type=text` 块 `\n` 拼接；**剔除 cache_control** |
+| `system` | string 直接用；array 只取 `type=text` 块 `\n` 拼接；**剔除 cache_control**；**剔除 `text` 以 `x-anthropic-billing-header` 开头的块**（见下"为什么剔除 billing header 块"）|
 | `tools` | 每个 tool 取 `(name, description, type)` 三元组；**按 (name, type, description) 升序**（避免数组顺序影响，三级 tiebreak 防 `sort.Slice` 不稳定）；`\x1f` 分字段 `\x1e` 分工具；**剔除 cache_control**；**不抓 `input_schema`**（见下"为什么不抓 input_schema"）|
 | `first_user_text` | 第一条 `role=user` 的 content：string 直接用；array 只取 `type=text` 块 `\n` 拼接 |
+
+### 为什么剔除 billing header 块
+
+Claude Code 等客户端会在 system 数组里注入一个独立的 text 块，形如：
+
+```json
+{
+  "system": [
+    {
+      "type": "text",
+      "text": "x-anthropic-billing-header: cc_version=2.1.145.61f; cc_entrypoint=claude-vscode; cch=adbaf;"
+    },
+    {
+      "type": "text",
+      "text": "(真正的 system prompt)",
+      "cache_control": { "type": "ephemeral" }
+    }
+  ]
+}
+```
+
+这块内容是给上游计费用的（cc_version 是客户端版本、cch 是会话/请求级别的随机串等），**Anthropic 服务端计算 prompt cache 时本身就不会把它纳入 cache key**——所以同一会话内两个相邻请求即便这一行 payload 不同，服务端 cache 仍然命中。
+
+我们的亲和指纹需要跟服务端 cache 行为对齐：如果把这个块喂进 sha256，cc_version / cch 一变指纹就漂，相同会话的请求会算出不同 fp、无法绑到同一 key，亲和直接失效。所以在 [`joinSystemTextBlocks`](internal/affinity/claude.go) 里按 `strings.HasPrefix(text, "x-anthropic-billing-header")` 判定后跳过。
+
+范围严格限定在 **system 数组**：字符串型 system、`tools`、`messages[].content` 都不过滤。原因——观察到的注入点就在 system 数组，越窄越不会误伤正文里偶尔出现这串字符的情况。由 `TestClaude_Fingerprint_StripsBillingHeaderInSystem` / `TestClaude_Fingerprint_BillingHeaderStripIsPrefixOnly` 锁住。
 
 ### 为什么不抓 input_schema
 
@@ -84,6 +110,7 @@ KV 之间用 `\x00` 分键值、`\x01` 分项，避免拼接歧义。
 | Web search / Citations toggle（本质是 tools 数组改动）| 重算 | ✅ |
 | System 改动 | 重算 | ✅ |
 | 第一条 user 改动 | 重算 | ✅ |
+| `x-anthropic-billing-header` 块变化（cc_version / cch 等）| 不变 | ✅（服务端 cache 也不算入）|
 | 仅 `input_schema` 改动（name/description/type 不变）| 不变 | ⚠️ 设计取舍（见"为什么不抓 input_schema"）|
 | 顶层 `speed` / `tool_choice` / `thinking` / `output_config` / images 等运行时参数 | 不变 | ⚠️ 设计取舍 |
 

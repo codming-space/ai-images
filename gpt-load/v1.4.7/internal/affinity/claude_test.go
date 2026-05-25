@@ -455,3 +455,78 @@ func TestClaude_Compute_RequiresCacheControl(t *testing.T) {
 		})
 	}
 }
+
+// Claude clients (e.g. Claude Code) inject a per-request telemetry text block
+// into the system array starting with `x-anthropic-billing-header:` — the
+// payload carries cc_version, cch and similar random metadata that drifts on
+// every request. The fingerprint must skip these blocks; otherwise two
+// otherwise-identical requests with different billing headers would produce
+// different fingerprints and never bind to the same key.
+func TestClaude_Fingerprint_StripsBillingHeaderInSystem(t *testing.T) {
+	f := &ClaudeFingerprinter{enabled: true, ttl: time.Hour}
+
+	withHeaderA := withCC(`{
+        "model": "claude-sonnet-4-5",
+        "system": [
+            {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.145.61f; cc_entrypoint=claude-vscode; cch=adbaf;"},
+            {"type": "text", "text": "you are a helpful assistant", "cache_control": {"type": "ephemeral"}}
+        ],
+        "messages": [{"role": "user", "content": "hi"}]
+    }`)
+	withHeaderB := withCC(`{
+        "model": "claude-sonnet-4-5",
+        "system": [
+            {"type": "text", "text": "x-anthropic-billing-header: cc_version=9.9.999.zzz; cc_entrypoint=somewhere-else; cch=ffffff;"},
+            {"type": "text", "text": "you are a helpful assistant", "cache_control": {"type": "ephemeral"}}
+        ],
+        "messages": [{"role": "user", "content": "hi"}]
+    }`)
+	withoutHeader := withCC(`{
+        "model": "claude-sonnet-4-5",
+        "system": [
+            {"type": "text", "text": "you are a helpful assistant", "cache_control": {"type": "ephemeral"}}
+        ],
+        "messages": [{"role": "user", "content": "hi"}]
+    }`)
+
+	fpA, okA := f.Compute("claude-sonnet-4-5", "/v1/messages", withHeaderA)
+	fpB, okB := f.Compute("claude-sonnet-4-5", "/v1/messages", withHeaderB)
+	fpNone, okNone := f.Compute("claude-sonnet-4-5", "/v1/messages", withoutHeader)
+	if !okA || !okB || !okNone {
+		t.Fatalf("expected all to match: okA=%v okB=%v okNone=%v", okA, okB, okNone)
+	}
+	if fpA != fpB {
+		t.Fatalf("billing-header text must not affect fp:\n  fpA=%s\n  fpB=%s", fpA, fpB)
+	}
+	if fpA != fpNone {
+		t.Fatalf("billing-header block must be stripped, equivalent to absent:\n  fpA=%s\n  fpNone=%s", fpA, fpNone)
+	}
+}
+
+// Guard against the strip rule eating real content: a system text block whose
+// payload happens to mention "x-anthropic-billing-header" later in the line
+// (rather than as a prefix) must still be kept.
+func TestClaude_Fingerprint_BillingHeaderStripIsPrefixOnly(t *testing.T) {
+	f := &ClaudeFingerprinter{enabled: true, ttl: time.Hour}
+
+	bodyA := withCC(`{
+        "model": "claude-sonnet-4-5",
+        "system": [
+            {"type": "text", "text": "note: x-anthropic-billing-header should be stripped", "cache_control": {"type": "ephemeral"}}
+        ],
+        "messages": [{"role": "user", "content": "hi"}]
+    }`)
+	bodyB := withCC(`{
+        "model": "claude-sonnet-4-5",
+        "system": [
+            {"type": "text", "text": "completely different system prompt", "cache_control": {"type": "ephemeral"}}
+        ],
+        "messages": [{"role": "user", "content": "hi"}]
+    }`)
+
+	fpA, _ := f.Compute("claude-sonnet-4-5", "/v1/messages", bodyA)
+	fpB, _ := f.Compute("claude-sonnet-4-5", "/v1/messages", bodyB)
+	if fpA == fpB {
+		t.Fatal("non-prefix mention of billing header must not be stripped")
+	}
+}

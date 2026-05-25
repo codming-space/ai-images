@@ -22,6 +22,12 @@ const (
 	claudePathExact = "/v1/messages"
 	// claudeDefaultTTLSeconds is the default TTL when CLAUDE_AFFINITY_TTL is unset.
 	claudeDefaultTTLSeconds = 3600
+	// claudeBillingHeaderPrefix marks client-side telemetry text blocks that
+	// Claude clients inject into the system array (e.g. cc_version, cch). The
+	// payload is per-request random metadata — including it in the fingerprint
+	// would make every request drift. Stripped during system normalization only;
+	// other content paths (first_user, tools) never carry it.
+	claudeBillingHeaderPrefix = "x-anthropic-billing-header"
 )
 
 var claudeModelRegex = regexp.MustCompile(`^claude-.*$`)
@@ -156,6 +162,9 @@ func rawIsPresent(raw json.RawMessage) bool {
 // normalizedSystem reduces the `system` field (string or []block) to a stable
 // plain text. Only blocks with type=text are included; cache_control fields
 // are dropped, so adding/removing a cache breakpoint never shifts the hash.
+// Text blocks starting with claudeBillingHeaderPrefix are skipped — they
+// carry per-request telemetry (cc_version / cch / etc.) that would otherwise
+// make the fingerprint drift on every request.
 func normalizedSystem(raw json.RawMessage) string {
 	s := bytes.TrimSpace(raw)
 	if len(s) == 0 {
@@ -173,7 +182,7 @@ func normalizedSystem(raw json.RawMessage) string {
 		if err != nil {
 			return ""
 		}
-		return joinTextBlocks(blocks)
+		return joinSystemTextBlocks(blocks)
 	}
 	return ""
 }
@@ -325,6 +334,28 @@ func joinTextBlocks(blocks []map[string]json.RawMessage) string {
 			sb.WriteByte('\n')
 		}
 		sb.WriteString(decodeJSONString(blk["text"]))
+	}
+	return sb.String()
+}
+
+// joinSystemTextBlocks joins type=text blocks from the system array, skipping
+// any block whose text starts with claudeBillingHeaderPrefix. Those blocks
+// carry per-request telemetry (cc_version / cch / etc.) and must not feed
+// into the fingerprint — otherwise every request looks unique.
+func joinSystemTextBlocks(blocks []map[string]json.RawMessage) string {
+	var sb strings.Builder
+	for _, blk := range blocks {
+		if decodeJSONString(blk["type"]) != "text" {
+			continue
+		}
+		text := decodeJSONString(blk["text"])
+		if strings.HasPrefix(text, claudeBillingHeaderPrefix) {
+			continue
+		}
+		if sb.Len() > 0 {
+			sb.WriteByte('\n')
+		}
+		sb.WriteString(text)
 	}
 	return sb.String()
 }
