@@ -1,0 +1,133 @@
+name: Build Custom New API v1 Docker Image
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The New API v1 tag to build from upstream"
+        required: true
+        default: "v1.0.0-rc.20"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/newapi
+
+jobs:
+  build-and-push-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      TAG: ${{ github.event.inputs.tag }}
+    steps:
+      - name: Set up environment
+        run: |
+          echo "Building custom New API v1 with tag: $TAG"
+
+      - name: Checkout upstream New API repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: 'QuantumNous/new-api'
+          ref: ${{ github.event.inputs.tag }}
+          path: 'upstream'
+
+      - name: Checkout override files
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          path: 'overrides'
+
+      - name: Apply overrides
+        run: |
+          echo "Applying override files for version $TAG"
+          if [ -d "overrides/new-api-v1/$TAG" ]; then
+            echo "Found override directory for $TAG"
+
+            echo "Files in override directory:"
+            find "overrides/new-api-v1/$TAG" -type f
+
+            echo "Applying override files..."
+            cp -r "overrides/new-api-v1/$TAG"/* upstream/
+            echo "Override files copied successfully"
+          else
+            echo "No override directory found for $TAG, proceeding with original upstream code"
+          fi
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: latest
+
+      - name: Build default theme with Bun
+        run: |
+          cd upstream/web
+
+          # Only the default theme is used. Build it from the full workspace install.
+          bun install
+          (cd default && DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION="$TAG" bun run build)
+
+          # The Go binary hard-embeds web/classic/dist (//go:embed) even though the
+          # classic theme is unused here — drop in a minimal stub so the build resolves.
+          mkdir -p classic/dist
+          printf '<!doctype html><meta charset="utf-8"><title>IINA</title>\n' > classic/dist/index.html
+
+          echo "Built dists:"
+          ls -la default/dist/index.html classic/dist/index.html
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26.1'
+          cache-dependency-path: upstream/go.sum
+
+      - name: Build Go binaries for all platforms
+        env:
+          CGO_ENABLED: '0'
+          GOEXPERIMENT: greenteagc
+          GOOS: linux
+        run: |
+          cd upstream
+          echo "$TAG" > VERSION
+          mkdir -p bin
+
+          # The Go binary embeds both theme dists (built above); build one per arch.
+          for arch in amd64 arm64; do
+            echo "Building for linux/$arch..."
+            GOARCH=$arch go build \
+              -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$(cat VERSION)'" \
+              -o "bin/new-api-$arch"
+          done
+
+          ls -la bin/
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ./upstream
+          file: ./upstream/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.event.inputs.tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64,linux/arm64
+          provenance: mode=max
+          sbom: true
