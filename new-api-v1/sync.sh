@@ -2,7 +2,7 @@
 
 # 定义源目录和目标目录
 SOURCE_DIR=~/Project/new-api-v1
-TARGET_DIR=~/Project/ai-images/new-api-v1/v1.0.0-rc.21
+TARGET_DIR=~/Project/ai-images/new-api-v1/v1.0.0-rc.22
 
 # 展开波浪号
 SOURCE_DIR="${SOURCE_DIR/#\~/$HOME}"
@@ -31,13 +31,14 @@ fi
 
 echo "正在查找修改过的文件..."
 
-# 获取所有修改过的文件（包括已暂存和未暂存的）
+# 获取所有修改过的文件（已暂存 + 未暂存 + 未跟踪）
+# git ls-files --modified 只看未暂存的改动，git add 过的文件会漏掉
 # --exclude-standard: 排除 .gitignore 中的文件
-MODIFIED_FILES=$(git ls-files --modified --others --exclude-standard)
+MODIFIED_FILES=$( { git diff --name-only HEAD; git ls-files --others --exclude-standard; } | sort -u )
 
 if [ -z "$MODIFIED_FILES" ]; then
     echo "没有发现修改过的文件"
-    exit 0
+    exit 1
 fi
 
 echo "找到以下修改过的文件:"
@@ -64,3 +65,27 @@ done <<< "$MODIFIED_FILES"
 
 echo ""
 echo "完成! 共复制了 $COPIED_COUNT 个文件到 $TARGET_DIR"
+
+# 清理不再是覆盖项的陈旧文件
+# 一个文件从覆盖集里移除后（比如改动被上游吸收，或者我们改用数据库配置），
+# 只拷不删会让它一直留在 tag 目录里，CI 仍然会把它盖到上游代码上。
+echo ""
+echo "正在检查陈旧文件..."
+STALE_COUNT=0
+while IFS= read -r target_file; do
+    rel="${target_file#$TARGET_DIR/}"
+    if ! grep -qxF "$rel" <<< "$MODIFIED_FILES"; then
+        rm "$target_file"
+        echo "✗ 已删除陈旧文件: $rel"
+        ((STALE_COUNT++))
+    fi
+done < <(find "$TARGET_DIR" -type f)
+
+# 删完文件后可能留下空目录
+find "$TARGET_DIR" -type d -empty -delete
+
+if [ "$STALE_COUNT" -eq 0 ]; then
+    echo "没有陈旧文件"
+else
+    echo "共删除了 $STALE_COUNT 个陈旧文件"
+fi

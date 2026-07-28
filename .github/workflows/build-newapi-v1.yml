@@ -5,7 +5,7 @@ on:
       tag:
         description: "The New API v1 tag to build from upstream"
         required: true
-        default: "v1.0.0-rc.20"
+        default: "v1.0.0-rc.22"
 
 env:
   REGISTRY: ghcr.io
@@ -39,39 +39,41 @@ jobs:
       - name: Apply overrides
         run: |
           echo "Applying override files for version $TAG"
-          if [ -d "overrides/new-api-v1/$TAG" ]; then
-            echo "Found override directory for $TAG"
-
-            echo "Files in override directory:"
-            find "overrides/new-api-v1/$TAG" -type f
-
-            echo "Applying override files..."
-            cp -r "overrides/new-api-v1/$TAG"/* upstream/
-            echo "Override files copied successfully"
-          else
-            echo "No override directory found for $TAG, proceeding with original upstream code"
+          if [ ! -d "overrides/new-api-v1/$TAG" ]; then
+            echo "::error::No override directory found for $TAG — refusing to build an unbranded image."
+            exit 1
           fi
+
+          echo "Files in override directory:"
+          find "overrides/new-api-v1/$TAG" -type f
+
+          echo "Applying override files..."
+          cp -r "overrides/new-api-v1/$TAG"/* upstream/
+          echo "Override files copied successfully"
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: latest
 
-      - name: Build default theme with Bun
+      - name: Build frontend with Bun
         run: |
           cd upstream/web
 
-          # Only the default theme is used. Build it from the full workspace install.
-          bun install
-          (cd default && DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION="$TAG" bun run build)
+          bun install --frozen-lockfile
+          DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION="$TAG" bun run build
 
-          # The Go binary hard-embeds web/classic/dist (//go:embed) even though the
-          # classic theme is unused here — drop in a minimal stub so the build resolves.
-          mkdir -p classic/dist
-          printf '<!doctype html><meta charset="utf-8"><title>IINA</title>\n' > classic/dist/index.html
+          echo "Built dist:"
+          ls -la dist/index.html
 
-          echo "Built dists:"
-          ls -la default/dist/index.html classic/dist/index.html
+          # The overrides are only useful if they actually reached the bundle.
+          # Fail loudly here rather than shipping an upstream-branded image.
+          grep -q '<title>IINA</title>' dist/index.html \
+            || { echo "::error::dist/index.html is not branded — overrides did not apply."; exit 1; }
+          for asset in favicon.ico logo.png vt323.ttf trees.png Dwarf_Scroll_IV.png; do
+            test -f "dist/$asset" \
+              || { echo "::error::missing branded asset dist/$asset"; exit 1; }
+          done
 
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -89,7 +91,7 @@ jobs:
           echo "$TAG" > VERSION
           mkdir -p bin
 
-          # The Go binary embeds both theme dists (built above); build one per arch.
+          # The Go binary embeds web/dist (built above); build one per arch.
           for arch in amd64 arm64; do
             echo "Building for linux/$arch..."
             GOARCH=$arch go build \
