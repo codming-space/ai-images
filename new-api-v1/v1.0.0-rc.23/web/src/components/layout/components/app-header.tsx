@@ -19,7 +19,6 @@ For commercial licensing, please contact support@quantumnous.com
 import { ConfigDrawer } from '@/components/config-drawer'
 import { NotificationPopover } from '@/components/notification-popover'
 import { ProfileDropdown } from '@/components/profile-dropdown'
-import { Search } from '@/components/search'
 import { useNotifications } from '@/hooks/use-notifications'
 import { useTopNavLinks } from '@/hooks/use-top-nav-links'
 
@@ -31,7 +30,7 @@ import { TopNav } from './top-nav'
 
 /**
  * General application Header component
- * Integrates navigation bar, search, configuration and profile functions
+ * Integrates navigation bar, configuration and profile functions
  *
  * @example
  * // Basic usage
@@ -42,8 +41,8 @@ import { TopNav } from './top-nav'
  * <AppHeader navLinks={customLinks} />
  *
  * @example
- * // Hide navigation bar and search box
- * <AppHeader showTopNav={false} showSearch={false} />
+ * // Hide navigation bar
+ * <AppHeader showTopNav={false} />
  *
  * @example
  * // Fully customize left and right content
@@ -66,11 +65,6 @@ type AppHeaderProps = {
    * Left content, overrides TopNav if provided
    */
   leftContent?: React.ReactNode
-  /**
-   * Whether to show search box
-   * @default true
-   */
-  showSearch?: boolean
   /**
    * Custom right content, overrides default right content if provided
    */
@@ -96,7 +90,6 @@ export function AppHeader({
   navLinks = defaultTopNavLinks,
   showTopNav = true,
   leftContent,
-  showSearch = true,
   rightContent,
   showNotifications = true,
   showConfigDrawer = true,
@@ -125,7 +118,6 @@ export function AppHeader({
                 <TopNav links={links} />
               </div>
             )}
-            {showSearch && <Search />}
             {showNotifications && (
               <NotificationPopover
                 open={notifications.popoverOpen}
