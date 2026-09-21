@@ -115,15 +115,22 @@ func (ps *ProxyServer) HandleProxy(c *gin.Context) {
 
 	isStream := channelHandler.IsStreamRequest(c, bodyBytes)
 
-	ps.executeRequestWithRetry(c, channelHandler, originalGroup, group, finalBodyBytes, isStream, startTime, 0, "", false)
+	ps.executeRequestWithRetry(c, channelHandler, originalGroup, group, finalBodyBytes, isStream, startTime, 0, "", false, nil)
+}
+
+// responseAffinityRetry is request-local and only created for eligible Responses
+// requests. Selecting the next key before logging a failure lets an exhausted
+// pool return the last upstream error with one final log for that attempt.
+type responseAffinityRetry struct {
+	failedKeys map[uint]struct{}
+	nextKey    *models.APIKey
 }
 
 // executeRequestWithRetry is the core recursive function for handling requests and retries.
 //
 // affinityFP and affinityHit are threaded through retries so that the final
-// outcome can either persist the fp->key mapping (on success) or clear a
-// poisoned mapping (on final failure). They are computed once at retryCount==0
-// and never recomputed during retries.
+// outcome can persist the fp->key mapping or clear it when the bound key fails.
+// The fingerprint is computed once at retryCount==0 and reused during retries.
 func (ps *ProxyServer) executeRequestWithRetry(
 	c *gin.Context,
 	channelHandler channel.ChannelProxy,
@@ -135,30 +142,41 @@ func (ps *ProxyServer) executeRequestWithRetry(
 	retryCount int,
 	affinityFP string,
 	affinityHit bool,
+	responseRetry *responseAffinityRetry,
 ) {
 	cfg := group.EffectiveConfig
 
 	var apiKey *models.APIKey
 	var err error
+	if responseRetry != nil {
+		apiKey = responseRetry.nextKey
+		responseRetry.nextKey = nil
+	}
 	// attemptStatus tracks how affinity influenced *this* attempt, for logging.
 	// It starts empty (no affinity engagement for retries) and is set at
 	// retryCount==0 from tryAffinityKey, then possibly upgraded to "unbind"
 	// when a hit-bound key fails on this attempt.
 	attemptStatus := affinity.StatusNone
 
-	// First attempt: try affinity. On retries we deliberately skip affinity so
-	// a failed key isn't picked again — the parent call already passes the
-	// affinityFP forward so we can still record/clear on the final outcome.
+	// First attempt: try affinity. Retries keep the fingerprint but do not look
+	// up the binding again. Responses additionally exclude keys already failed.
 	if retryCount == 0 {
 		newFP, hit, key, status := ps.tryAffinityKey(c, channelHandler, group, bodyBytes)
 		affinityFP = newFP
 		affinityHit = hit
 		apiKey = key
 		attemptStatus = status
+		if group.ChannelType == affinity.OpenAIResponseChannelType && affinityFP != "" {
+			responseRetry = &responseAffinityRetry{failedKeys: make(map[uint]struct{})}
+		}
 	}
 
 	if apiKey == nil {
-		apiKey, err = ps.keyProvider.SelectKey(group.ID)
+		if responseRetry != nil {
+			apiKey, err = ps.keyProvider.SelectKeyExcluding(group.ID, responseRetry.failedKeys)
+		} else {
+			apiKey, err = ps.keyProvider.SelectKey(group.ID)
+		}
 		if err != nil {
 			logrus.Errorf("Failed to select a key for group %s on attempt %d: %v", group.Name, retryCount+1, err)
 			response.Error(c, app_errors.NewAPIError(app_errors.ErrNoKeysAvailable, err.Error()))
@@ -271,8 +289,8 @@ func (ps *ProxyServer) executeRequestWithRetry(
 		ps.keyProvider.UpdateStatus(apiKey, group, false, parsedError)
 
 		// If we just failed on an affinity-bound key, drop the binding
-		// immediately (don't wait for isLastAttempt). Retries pick a fresh
-		// key via plain round-robin; if the retry chain ultimately succeeds,
+		// immediately (don't wait for isLastAttempt). Retries use round-robin,
+		// excluding failed keys for eligible Responses requests; on success,
 		// the Record(SETNX) below will establish a new binding to the
 		// key that actually worked. Without this, SETNX would no-op on the
 		// stale mapping and future requests with the same fp would keep
@@ -287,6 +305,18 @@ func (ps *ProxyServer) executeRequestWithRetry(
 
 		// 判断是否为最后一次尝试
 		isLastAttempt := retryCount >= cfg.MaxRetries
+		if responseRetry != nil {
+			responseRetry.failedKeys[apiKey.ID] = struct{}{}
+			if !isLastAttempt {
+				nextKey, selectErr := ps.keyProvider.SelectKeyExcluding(group.ID, responseRetry.failedKeys)
+				if selectErr != nil {
+					logrus.WithError(selectErr).Debug("affinity: no next Responses key, returning last upstream error")
+					isLastAttempt = true
+				} else {
+					responseRetry.nextKey = nextKey
+				}
+			}
+		}
 		requestType := models.RequestTypeRetry
 		if isLastAttempt {
 			requestType = models.RequestTypeFinal
@@ -305,7 +335,7 @@ func (ps *ProxyServer) executeRequestWithRetry(
 			return
 		}
 
-		ps.executeRequestWithRetry(c, channelHandler, originalGroup, group, bodyBytes, isStream, startTime, retryCount+1, affinityFP, affinityHit)
+		ps.executeRequestWithRetry(c, channelHandler, originalGroup, group, bodyBytes, isStream, startTime, retryCount+1, affinityFP, affinityHit, responseRetry)
 		return
 	}
 
@@ -314,7 +344,8 @@ func (ps *ProxyServer) executeRequestWithRetry(
 
 	// Affinity bookkeeping on success: SETNX so we don't churn an existing
 	// mapping; a no-op when fp was already bound to a key (including this one).
-	if affinityFP != "" {
+	// Responses only records HTTP 200; non-retryable errors such as 404 do not bind.
+	if affinityFP != "" && (group.ChannelType != affinity.OpenAIResponseChannelType || resp.StatusCode == http.StatusOK) {
 		if err := ps.affinityProvider.Record(group.ID, affinityFP, apiKey.ID, ps.affinityTTL(group.ChannelType)); err != nil {
 			logrus.WithError(err).Debug("affinity: record failed (non-fatal)")
 		}
@@ -345,7 +376,8 @@ func (ps *ProxyServer) executeRequestWithRetry(
 // request. Returns (fp, hit, key, status):
 //   - fp == "": the request does not qualify for affinity (no fingerprinter,
 //     disabled, model/path mismatch, empty first_user_text, etc.). The caller
-//     should fall through to plain round-robin. status is affinity.StatusNone.
+//     should fall through to plain round-robin. status is StatusNone when the
+//     feature is disabled/unsupported, otherwise StatusSkip.
 //   - fp != "", key != nil: a previously bound key was found and is still
 //     active. hit is true, status is affinity.StatusHit.
 //   - fp != "", key == nil: the request qualifies but either has no binding
@@ -367,6 +399,20 @@ func (ps *ProxyServer) tryAffinityKey(
 		return "", false, nil, affinity.StatusNone
 	}
 	model := channelHandler.ExtractModel(c, bodyBytes)
+	if group.ChannelType == affinity.OpenAIResponseChannelType {
+		if c.Request.Method != http.MethodPost {
+			return "", false, nil, affinity.StatusSkip
+		}
+		// Match BaseChannel.ApplyModelRedirect without changing the body or
+		// applying redirects twice. An empty redirect map is a no-op there.
+		if len(group.ModelRedirectMap) > 0 {
+			if target, found := group.ModelRedirectMap[model]; found {
+				model = target
+			} else if group.ModelRedirectStrict {
+				return "", false, nil, affinity.StatusSkip
+			}
+		}
+	}
 	// Use c.Param("path") rather than c.Request.URL.Path: the proxy route is
 	// "/proxy/:group_name/*path", so URL.Path is "/proxy/claude/v1/messages"
 	// while the fingerprinter expects the upstream path "/v1/messages".

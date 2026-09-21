@@ -20,9 +20,9 @@ import (
 // can spot-check hit rates and re-binding behavior in the admin UI.
 const (
 	// StatusNone — request is *outside the affinity surface*: no Fingerprinter
-	// registered for this channel_type (e.g. OpenAI/Gemini requests) or the
-	// feature is globally disabled. Stored as "" so existing rows / non-Claude
-	// channels naturally fall in this bucket.
+	// registered for this channel_type (e.g. Chat Completions/Gemini) or the
+	// channel's affinity feature is disabled. Existing rows and retry attempts
+	// also use this empty status.
 	StatusNone = ""
 	// StatusSkip — request *belongs* to a channel that supports affinity, but
 	// this particular request did not qualify (e.g. wrong path, no
@@ -84,7 +84,8 @@ func NewProvider(s store.Store) Provider {
 	return &provider{
 		store: s,
 		fps: map[string]Fingerprinter{
-			claudeChannelType: newClaudeFingerprinter(),
+			claudeChannelType:         newClaudeFingerprinter(),
+			OpenAIResponseChannelType: newOpenAIResponseFingerprinter(),
 		},
 	}
 }

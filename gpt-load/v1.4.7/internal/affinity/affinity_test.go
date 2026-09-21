@@ -70,7 +70,10 @@ func TestStoreProvider_FingerprinterRegistration(t *testing.T) {
 	if _, ok := p.Fingerprinter("anthropic"); !ok {
 		t.Fatal("expected fingerprinter registered for anthropic")
 	}
+	if _, ok := p.Fingerprinter(OpenAIResponseChannelType); !ok {
+		t.Fatal("expected fingerprinter registered for Responses")
+	}
 	if _, ok := p.Fingerprinter("openai"); ok {
-		t.Fatal("expected no fingerprinter for openai (not yet implemented)")
+		t.Fatal("expected no fingerprinter for Chat Completions")
 	}
 }

@@ -55,6 +55,44 @@ func (p *KeyProvider) SelectKey(groupID uint) (*models.APIKey, error) {
 	return p.loadKeyByID(uint(keyID))
 }
 
+// SelectKeyExcluding rotates at most one snapshot of the active list. Responses
+// affinity retries use it to avoid selecting a key that failed in this request.
+// It leaves the original SelectKey behavior unchanged for other traffic.
+func (p *KeyProvider) SelectKeyExcluding(groupID uint, excluded map[uint]struct{}) (*models.APIKey, error) {
+	listKey := fmt.Sprintf("group:%d:active_keys", groupID)
+	count, err := p.store.LLen(listKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to count active keys: %w", err)
+	}
+	for range count {
+		rawID, err := p.store.Rotate(listKey)
+		if errors.Is(err, store.ErrNotFound) {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to rotate key from store: %w", err)
+		}
+		id, err := strconv.ParseUint(rawID, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse key ID %q: %w", rawID, err)
+		}
+		if _, skip := excluded[uint(id)]; skip {
+			continue
+		}
+		key, err := p.loadKeyByID(uint(id))
+		if errors.Is(err, store.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if key.Status == models.KeyStatusActive && key.GroupID == groupID {
+			return key, nil
+		}
+	}
+	return nil, app_errors.ErrNoActiveKeys
+}
+
 // GetKeyByID directly fetches an APIKey by its numeric ID without rotating
 // the active-keys list. Used by the affinity layer to materialize a key that
 // was previously bound to a request fingerprint. Returns store.ErrNotFound
