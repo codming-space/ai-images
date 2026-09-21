@@ -16,15 +16,23 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// OpenAIResponseChannelType identifies the Responses channel, independently of
-// the OpenAI Chat Completions channel.
-const OpenAIResponseChannelType = "openai-response"
+// Both OpenAI-compatible channels can forward requests to /v1/responses.
+const (
+	OpenAIChannelType         = "openai"
+	OpenAIResponseChannelType = "openai-response"
+)
 
 const (
 	openAIResponsePath       = "/v1/responses"
 	openAIResponseDefaultTTL = 7200 * time.Second
 	openAIResponsePrefix     = "openai-responses-v1:"
 )
+
+// IsOpenAIResponseRoute checks the actual upstream path captured by Gin's
+// /*path parameter. The group name and /proxy prefix do not belong to it.
+func IsOpenAIResponseRoute(channelType, path string) bool {
+	return (channelType == OpenAIChannelType || channelType == OpenAIResponseChannelType) && path == openAIResponsePath
+}
 
 // OpenAIResponseFingerprinter groups stateless requests by their initial text
 // and tool identities. It does not reproduce the upstream prompt cache key.

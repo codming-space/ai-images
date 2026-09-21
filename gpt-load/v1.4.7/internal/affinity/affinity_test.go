@@ -73,7 +73,11 @@ func TestStoreProvider_FingerprinterRegistration(t *testing.T) {
 	if _, ok := p.Fingerprinter(OpenAIResponseChannelType); !ok {
 		t.Fatal("expected fingerprinter registered for Responses")
 	}
-	if _, ok := p.Fingerprinter("openai"); ok {
-		t.Fatal("expected no fingerprinter for Chat Completions")
+	responses, _ := p.Fingerprinter(OpenAIResponseChannelType)
+	if general, ok := p.Fingerprinter(OpenAIChannelType); !ok || general != responses {
+		t.Fatal("expected both OpenAI channels to share Responses affinity configuration")
+	}
+	if _, ok := p.Fingerprinter("gemini"); ok {
+		t.Fatal("unexpected Gemini fingerprinter")
 	}
 }

@@ -166,7 +166,7 @@ func (ps *ProxyServer) executeRequestWithRetry(
 		affinityHit = hit
 		apiKey = key
 		attemptStatus = status
-		if group.ChannelType == affinity.OpenAIResponseChannelType && affinityFP != "" {
+		if affinity.IsOpenAIResponseRoute(group.ChannelType, c.Param("path")) && affinityFP != "" {
 			responseRetry = &responseAffinityRetry{failedKeys: make(map[uint]struct{})}
 		}
 	}
@@ -345,7 +345,7 @@ func (ps *ProxyServer) executeRequestWithRetry(
 	// Affinity bookkeeping on success: SETNX so we don't churn an existing
 	// mapping; a no-op when fp was already bound to a key (including this one).
 	// Responses only records HTTP 200; non-retryable errors such as 404 do not bind.
-	if affinityFP != "" && (group.ChannelType != affinity.OpenAIResponseChannelType || resp.StatusCode == http.StatusOK) {
+	if affinityFP != "" && (responseRetry == nil || resp.StatusCode == http.StatusOK) {
 		if err := ps.affinityProvider.Record(group.ID, affinityFP, apiKey.ID, ps.affinityTTL(group.ChannelType)); err != nil {
 			logrus.WithError(err).Debug("affinity: record failed (non-fatal)")
 		}
@@ -398,8 +398,15 @@ func (ps *ProxyServer) tryAffinityKey(
 	if !ok || !fp.Enabled() {
 		return "", false, nil, affinity.StatusNone
 	}
+	path := c.Param("path")
+	isResponses := affinity.IsOpenAIResponseRoute(group.ChannelType, path)
+	if group.ChannelType == affinity.OpenAIChannelType && !isResponses {
+		// Registering the general OpenAI channel must not enroll Chat
+		// Completions, model listing, or other endpoints in Responses affinity.
+		return "", false, nil, affinity.StatusNone
+	}
 	model := channelHandler.ExtractModel(c, bodyBytes)
-	if group.ChannelType == affinity.OpenAIResponseChannelType {
+	if isResponses {
 		if c.Request.Method != http.MethodPost {
 			return "", false, nil, affinity.StatusSkip
 		}
@@ -413,10 +420,9 @@ func (ps *ProxyServer) tryAffinityKey(
 			}
 		}
 	}
-	// Use c.Param("path") rather than c.Request.URL.Path: the proxy route is
-	// "/proxy/:group_name/*path", so URL.Path is "/proxy/claude/v1/messages"
-	// while the fingerprinter expects the upstream path "/v1/messages".
-	fingerprint, matched := fp.Compute(model, c.Param("path"), bodyBytes)
+	// /proxy/openai/v1/responses is captured as path=/v1/responses, regardless
+	// of the group name. Claude uses the same capture for /v1/messages.
+	fingerprint, matched := fp.Compute(model, path, bodyBytes)
 	if !matched {
 		// The channel supports affinity but this particular request didn't
 		// qualify (path mismatch / no cache_control / empty first_user / ...).

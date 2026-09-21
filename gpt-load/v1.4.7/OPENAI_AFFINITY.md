@@ -6,7 +6,7 @@
 
 在同一个实际分组内，将具有相同稳定前缀的无状态 Responses 请求，优先分配到此前使用成功的 API key，减少轮询造成的缓存分散。指纹使用四项：**实际模型、系统提示词文本、简化后的工具列表、首条用户输入文本**。每个工具只取 `(name, description, type)` 三元组；Schema、运行参数和后续对话不参与，避免这些字段变化时更换绑定。
 
-仅支持 `openai-response` 通道的 `POST /v1/responses`，包括普通 JSON 响应和 HTTP SSE。复用现有 `affinity.Provider`、Store、密钥状态检查和日志字段。默认关闭，通过独立环境变量启用。
+支持 `openai` 和 `openai-response` 两种通道的 `POST /v1/responses`，包括普通 JSON 响应和 HTTP SSE。以实际请求路径判断 Responses，不要求分组改成专用通道类型。复用现有 `affinity.Provider`、Store、密钥状态检查和日志字段。默认关闭，通过独立环境变量启用。
 
 不处理 `previous_response_id`、`conversation` 等上游会话状态，不建立 response ID 到 key 的映射，不覆盖 Chat Completions、WebSocket、后台任务查询、Responses 检索或 `/v1/responses/compact`。
 
@@ -78,7 +78,7 @@ ZDR 指 Zero Data Retention。官方在 **2026-05-29** 将未启用 ZDR 组织�
 
 | 代码位置 | 已确认行为 | 设计要求 |
 |---|---|---|
-| `internal/channel/openai_response_channel.go` | 通道注册名为 `openai-response` | 新指纹器注册到这个名称，保留 `openai` 通道的现有行为 |
+| `internal/channel/openai_channel.go`、`openai_response_channel.go` | `openai` 和 `openai-response` 都能转发 `/v1/responses` | 两个通道共用 Responses 指纹器，普通 OpenAI 通道的其他路径不参与亲和 |
 | `internal/proxy/server.go` 的 `HandleProxy` | 先选择聚合分组的子分组，再执行 `applyParamOverrides` | 使用实际子分组 ID；根据参数覆盖后的正文计算指纹 |
 | 同文件的 `tryAffinityKey` | 已提供指纹计算、查映射、key 状态及所属分组检查 | 在这里增加 Responses 的 HTTP 方法限制和实际模型解析 |
 | 同文件的 `executeRequestWithRetry` | 亲和选 key 之后才调用 `ApplyModelRedirect` | 提前只读解析实际模型，不为了计算指纹再次改写请求 |
@@ -110,7 +110,7 @@ OPENAI_AFFINITY_TTL=7200
 
 | 条件 | 规则 |
 |---|---|
-| 通道、开关 | `group.ChannelType == "openai-response"` 且开关已启用 |
+| 通道、开关 | `group.ChannelType` 为 `openai` 或 `openai-response`，且开关已启用 |
 | 方法、路径 | `c.Request.Method == POST`，`c.Param("path") == "/v1/responses"`；不使用带 `/proxy/{group}` 的完整路径 |
 | 模型 | 覆盖及重定向后的模型为非空字符串；不维护 `gpt-*` 等模型白名单，以支持别名和兼容上游 |
 | JSON | 正文为合法 JSON 对象；参与提取的字段类型可识别 |
@@ -120,6 +120,8 @@ OPENAI_AFFINITY_TTL=7200
 | 输入前缀 | 能提取下文定义的完整初始文本前缀，且首条用户消息至少有一个非空文本块 |
 
 方法检查放在代理层，保持 `Fingerprinter.Compute(model, path, body)` 接口不变。`store=true` 只表示存储当前响应，本次请求若已提供完整输入仍可亲和；将来通过响应 ID 查询或续接不在本设计范围内。[2][3]
+
+例如，请求 `/proxy/openai/v1/responses` 的 Gin 路径参数为 `/v1/responses`；`openai` 是分组名称，不参与指纹器的路径匹配。普通 `openai` 通道转发 `/v1/chat/completions` 等其他路径时，继续使用原轮询，亲和状态保持空值。
 
 不要求 Anthropic 的 `cache_control`，也不要求客户端必须传入 `prompt_cache_key`。亲和层不验证所有模型的缓存开关和断点组合；即使请求未产生服务端缓存，正常转发也不依赖本地亲和是否生效。
 
@@ -221,7 +223,7 @@ Store 逻辑键: gpt-load:affinity:v1:{actual_group_id}:{fingerprint}
 
 ```text
 首次尝试：
-  通道未启用                         → 原轮询，日志 ""
+  通道未启用 / 普通 OpenAI 的其他路径 → 原轮询，日志 ""
   已启用但不满足资格                 → 原轮询，日志 skip
   无绑定 / Lookup 出错               → 原轮询，日志 miss
   绑定 key active 且属于当前分组      → 使用绑定 key，日志 hit
@@ -282,7 +284,7 @@ HTTP 200 是本阶段的绑定成功标准。现有代理在收到响应头后�
 | 文件 | 内容 |
 |---|---|
 | `internal/affinity/openai_response.go`（新增） | 配置、Responses 资格检查、初始文本前缀提取、工具三元组排序和指纹编码 |
-| `internal/affinity/affinity.go` | 注册 `openai-response` 指纹器，调整仅以 Claude 为例的接口注释 |
+| `internal/affinity/affinity.go` | 为 `openai` / `openai-response` 注册同一个 Responses 指纹器，共用开关和 TTL |
 | `internal/proxy/server.go` | Responses 专属 POST 检查、实际模型解析、HTTP 200 记录条件及失败 key 集合传递 |
 | `internal/keypool/provider.go` | 独立的有界 `SelectKeyExcluding`，保留原 `SelectKey` |
 | 对应 `*_test.go`、现有 affinity benchmark | 指纹、代理行为、候选排除和资源开销验证 |
@@ -293,7 +295,7 @@ HTTP 200 是本阶段的绑定成功标准。现有代理在收到响应头后�
 
 | 类别 | 场景与预期 |
 |---|---|
-| 范围 | 开关关闭保持原行为；`openai`、其他路由、非 POST 不参与；状态引用、托管 prompt、后台请求跳过 |
+| 范围 | 两种 OpenAI 通道通过实际 Gin 路由测试 `miss → hit`；普通 OpenAI 的其他路径保持原行为；非 POST、状态引用、托管 prompt、后台请求跳过；开关关闭保持原行为 |
 | 输入形式 | 字符串 input、单条 user 字符串 content、单个 input_text 块生成相同指纹；允许开头多条 system/developer 消息 |
 | 前缀稳定 | 追加 assistant、user、工具结果或内联 reasoning 不改变指纹；后续仍出现 item_reference 则跳过 |
 | 内容差异 | 实际模型、提取后的系统文本或首条用户文本变化时改变指纹；指令来源或块边界变化但拼接文本相同时保持指纹 |

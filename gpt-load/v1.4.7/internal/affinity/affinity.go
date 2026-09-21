@@ -20,9 +20,9 @@ import (
 // can spot-check hit rates and re-binding behavior in the admin UI.
 const (
 	// StatusNone — request is *outside the affinity surface*: no Fingerprinter
-	// registered for this channel_type (e.g. Chat Completions/Gemini) or the
-	// channel's affinity feature is disabled. Existing rows and retry attempts
-	// also use this empty status.
+	// registered for this channel_type (e.g. Gemini), the feature is disabled,
+	// or an ordinary OpenAI channel is forwarding a non-Responses request.
+	// Existing rows and retry attempts also use this empty status.
 	StatusNone = ""
 	// StatusSkip — request *belongs* to a channel that supports affinity, but
 	// this particular request did not qualify (e.g. wrong path, no
@@ -79,13 +79,15 @@ type provider struct {
 }
 
 // NewProvider builds the affinity provider with per-channel Fingerprinters.
-// Add new channel types here (e.g. "openai", "gemini") when supported.
+// The OpenAI channels share a fingerprinter and are gated by the request path.
 func NewProvider(s store.Store) Provider {
+	openAI := newOpenAIResponseFingerprinter()
 	return &provider{
 		store: s,
 		fps: map[string]Fingerprinter{
 			claudeChannelType:         newClaudeFingerprinter(),
-			OpenAIResponseChannelType: newOpenAIResponseFingerprinter(),
+			OpenAIChannelType:         openAI,
+			OpenAIResponseChannelType: openAI,
 		},
 	}
 }

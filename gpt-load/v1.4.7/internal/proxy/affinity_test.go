@@ -94,19 +94,33 @@ func affinityHTTPResponse(req *http.Request, status int, body string) *http.Resp
 func (h *affinityHarness) request(t *testing.T, method, path, body string) (*httptest.ResponseRecorder, []models.RequestLog) {
 	t.Helper()
 	w := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(w)
-	c.Request = httptest.NewRequest(method, "/proxy/responses"+path, strings.NewReader(body))
-	c.Request.Header.Set("Authorization", "Bearer proxy-secret")
-	c.Request.Header.Set("Content-Type", "application/json")
-	c.Request.Header.Set("X-Test-Header", "unchanged")
-	c.Params = gin.Params{{Key: "path", Value: path}, {Key: "group_name", Value: h.group.Name}}
-	original := []byte(body)
-	overridden, err := h.server.applyParamOverrides(original, h.group)
-	if err != nil {
-		t.Fatal(err)
+	req := httptest.NewRequest(method, "/proxy/"+h.group.Name+path, strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer proxy-secret")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Test-Header", "unchanged")
+	var ch channel.ChannelProxy = h.channel
+	switch h.group.ChannelType {
+	case affinity.OpenAIChannelType:
+		ch = &channel.OpenAIChannel{BaseChannel: h.channel.BaseChannel}
+	case "anthropic":
+		ch = &channel.AnthropicChannel{BaseChannel: h.channel.BaseChannel}
 	}
-	h.server.executeRequestWithRetry(c, h.channel, h.group, h.group, overridden,
-		h.channel.IsStreamRequest(c, original), time.Now(), 0, "", false, nil)
+	// Use the production route pattern, rather than manually filling c.Params.
+	router := gin.New()
+	router.Group("/proxy/:group_name").Any("/*path", func(c *gin.Context) {
+		original, err := io.ReadAll(c.Request.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.Request.Body.Close()
+		overridden, err := h.server.applyParamOverrides(original, h.group)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.server.executeRequestWithRetry(c, ch, h.group, h.group, overridden,
+			ch.IsStreamRequest(c, original), time.Now(), 0, "", false, nil)
+	})
+	router.ServeHTTP(w, req)
 	keys, err := h.store.SPopN(services.PendingLogKeysSet, 100)
 	if err != nil {
 		t.Fatal(err)
@@ -182,6 +196,98 @@ func TestResponsesAffinityNormalizedHistoryAndLogs(t *testing.T) {
 		if logs[0].IsStream != (i == 1) {
 			t.Fatal("streaming log flag changed")
 		}
+	}
+}
+
+func TestResponsesAffinityBothOpenAIChannels(t *testing.T) {
+	for _, channelType := range []string{affinity.OpenAIChannelType, affinity.OpenAIResponseChannelType} {
+		t.Run(channelType, func(t *testing.T) {
+			h := newAffinityHarness(t)
+			h.group.Name = "openai"
+			h.group.ChannelType = channelType
+			h.group.ModelRedirectMap = map[string]string{"alias": "model"}
+			const body = `{"model":"model","instructions":"rules","input":"help"}`
+			for i, requestBody := range []string{strings.Replace(body, `"model":"model"`, `"model":"alias"`, 1), body} {
+				w, logs := h.request(t, http.MethodPost, "/v1/responses?source=test", requestBody)
+				if w.Code != 200 || len(logs) != 1 || logs[0].RequestPath != "/proxy/openai/v1/responses?source=test" {
+					t.Fatalf("unexpected routed response: status=%d logs=%v", w.Code, logs)
+				}
+				want := affinity.StatusMiss
+				if i == 1 {
+					want = affinity.StatusHit
+				}
+				assertAffinityLog(t, logs[0], want, "key-1")
+			}
+			if ttl := h.server.affinityTTL(channelType); ttl != 2*time.Hour {
+				t.Fatalf("channel TTL mismatch: %s", ttl)
+			}
+
+			// A binding lookup does not rotate the pool. Leave the failing key
+			// at the next rotation position to verify exclusion on both channels.
+			if err := h.store.Delete("group:7:active_keys"); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.store.LPush("group:7:active_keys", 2, 1); err != nil {
+				t.Fatal(err)
+			}
+			var attempts []string
+			h.client.Transport = affinityTransport(func(req *http.Request) (*http.Response, error) {
+				key := req.Header.Get("Authorization")
+				attempts = append(attempts, key)
+				if key == "Bearer key-1" {
+					return affinityHTTPResponse(req, 429, `{"error":{"message":"resource has been exhausted"}}`), nil
+				}
+				return affinityHTTPResponse(req, 200, `{}`), nil
+			})
+			w, logs := h.request(t, http.MethodPost, "/v1/responses", body)
+			if w.Code != 200 || len(logs) != 2 || len(attempts) != 2 || attempts[1] != "Bearer key-2" {
+				t.Fatalf("retry did not switch keys: status=%d attempts=%v logs=%v", w.Code, attempts, logs)
+			}
+			assertAffinityLog(t, logs[0], affinity.StatusUnbind, "key-1")
+			assertAffinityLog(t, logs[1], affinity.StatusNone, "key-2")
+			if id, found := h.server.affinityProvider.Lookup(h.group.ID, h.fingerprint(t, body)); !found || id != 2 {
+				t.Fatal("retry success did not rebind")
+			}
+
+			h.client.Transport = affinityTransport(func(req *http.Request) (*http.Response, error) {
+				return affinityHTTPResponse(req, 404, `{"error":"unknown model"}`), nil
+			})
+			newBody := strings.Replace(body, `"help"`, `"different input"`, 1)
+			w, logs = h.request(t, http.MethodPost, "/v1/responses", newBody)
+			if w.Code != 404 || len(logs) != 1 {
+				t.Fatalf("unexpected 404 response: %d %v", w.Code, logs)
+			}
+			if _, found := h.server.affinityProvider.Lookup(h.group.ID, h.fingerprint(t, newBody)); found {
+				t.Fatal("non-retryable error created a binding")
+			}
+		})
+	}
+}
+
+func TestGeneralOpenAIChannelNonResponsesStayUnchanged(t *testing.T) {
+	h := newAffinityHarness(t)
+	h.group.Name = "openai"
+	h.group.ChannelType = affinity.OpenAIChannelType
+	for _, path := range []string{"/v1/chat/completions", "/v1/models", "/v1/responses/compact"} {
+		_, logs := h.request(t, http.MethodPost, path, `{"model":"model","input":"help"}`)
+		if len(logs) != 1 || logs[0].AffinityStatus != affinity.StatusNone {
+			t.Fatalf("non-Responses endpoint enrolled in affinity: %s %v", path, logs)
+		}
+	}
+	for _, tc := range []struct{ method, body string }{
+		{http.MethodGet, `{"model":"model","input":"help"}`},
+		{http.MethodPost, `{"model":"model","input":"help","previous_response_id":"r1"}`},
+	} {
+		_, logs := h.request(t, tc.method, "/v1/responses", tc.body)
+		if len(logs) != 1 || logs[0].AffinityStatus != affinity.StatusSkip {
+			t.Fatalf("ineligible Responses request did not skip: %v", logs)
+		}
+	}
+	t.Setenv("OPENAI_AFFINITY_ENABLED", "false")
+	h.server.affinityProvider = affinity.NewProvider(h.store)
+	_, logs := h.request(t, http.MethodPost, "/v1/responses", `{"model":"model","input":"help"}`)
+	if len(logs) != 1 || logs[0].AffinityStatus != affinity.StatusNone {
+		t.Fatal("disabled OpenAI affinity was not bypassed")
 	}
 }
 
@@ -407,8 +513,6 @@ func TestResponsesAffinityHTTP200StreamFailureBoundary(t *testing.T) {
 func TestClaudeAffinityProxyBehaviorPreserved(t *testing.T) {
 	h := newAffinityHarness(t)
 	h.group.ChannelType = "anthropic"
-	// The channel used here shares JSON model extraction and transport behavior
-	// with Claude; fingerprint dispatch is determined by the actual group type.
 	body := `{"model":"claude-sonnet","system":"rules","messages":[{"role":"user","content":"help"}],"cache_control":{"type":"ephemeral"}}`
 	for i := range 2 {
 		w, logs := h.request(t, http.MethodPost, "/v1/messages", body)
